@@ -19,9 +19,9 @@ import pandas as pd
 from ... import opcodes
 from ...core import ENTITY_TYPE, get_output_types, recursive_tile
 from ...serialization.serializables import AnyField, Int8Field, KeyField
-from ...utils import has_unknown_shape
+from ...utils import has_unknown_shape, is_same_module
 from ..operands import DataFrameOperand, DataFrameOperandMixin
-from ..utils import parse_index, validate_axis
+from ..utils import get_xdf, parse_index, validate_axis
 
 
 class DataFrameSetAxis(DataFrameOperand, DataFrameOperandMixin):
@@ -171,23 +171,33 @@ class DataFrameSetAxis(DataFrameOperand, DataFrameOperandMixin):
         value = op.value
         if isinstance(value, ENTITY_TYPE):
             value = ctx[value.key]
-        ctx[op.outputs[0].key] = in_data.set_axis(value, axis=op.axis)
+
+        xdf = get_xdf(in_data)
+        if is_same_module(xdf, pd):
+            ctx[op.outputs[0].key] = in_data.set_axis(value, axis=op.axis)
+        else:
+            # cudf does not support set_axis.
+            if op.axis == 0:
+                in_data.index = value
+            else:
+                in_data.columns = value
+            ctx[op.outputs[0].key] = in_data
 
 
-def _set_axis(df_or_axis, labels, axis=0, inplace=False):
+def _set_axis(df_or_axis, labels, axis=0, copy=False):
     axis = validate_axis(axis, df_or_axis)
     if not isinstance(labels, ENTITY_TYPE) and not isinstance(labels, pd.Index):
         labels = pd.Index(labels)
 
     op = DataFrameSetAxis(value=labels, axis=axis)
     result = op(df_or_axis)
-    if inplace:
+    if not copy:
         df_or_axis.data = result.data
     else:
         return result
 
 
-def df_set_axis(df, labels, axis=0, inplace=False):
+def df_set_axis(df, labels, axis=0, copy=True):
     """
     Assign desired index to given axis.
 
@@ -202,13 +212,13 @@ def df_set_axis(df, labels, axis=0, inplace=False):
     axis : {0 or 'index', 1 or 'columns'}, default 0
         The axis to update. The value 0 identifies the rows, and 1 identifies the columns.
 
-    inplace : bool, default False
-        Whether to return a new DataFrame instance.
+    copy : bool, default True
+        Whether to make a copy of the underlying data.
 
     Returns
     -------
     renamed : DataFrame or None
-        An object of type DataFrame or None if ``inplace=True``.
+        An object of type DataFrame.
 
     See Also
     --------
@@ -234,20 +244,11 @@ def df_set_axis(df, labels, axis=0, inplace=False):
     0  1   4
     1  2   5
     2  3   6
-
-    Now, update the labels inplace.
-
-    >>> df.set_axis(['i', 'ii'], axis='columns', inplace=True)
-    >>> df.execute()
-       i  ii
-    0  1   4
-    1  2   5
-    2  3   6
     """
-    return _set_axis(df, labels, axis=axis, inplace=inplace)
+    return _set_axis(df, labels, axis=axis, copy=copy)
 
 
-def series_set_axis(series, labels, axis=0, inplace=False):
+def series_set_axis(series, labels, axis=0, copy=True):
     """
     Assign desired index to given axis.
 
@@ -262,13 +263,13 @@ def series_set_axis(series, labels, axis=0, inplace=False):
     axis : {0 or 'index'}, default 0
         The axis to update. The value 0 identifies the rows.
 
-    inplace : bool, default False
+    copy : bool, default False
         Whether to return a new Series instance.
 
     Returns
     -------
     renamed : Series or None
-        An object of type Series or None if ``inplace=True``.
+        An object of type Series.
 
     See Also
     --------
@@ -290,4 +291,4 @@ def series_set_axis(series, labels, axis=0, inplace=False):
     c    3
     dtype: int64
     """
-    return _set_axis(series, labels, axis=axis, inplace=inplace)
+    return _set_axis(series, labels, axis=axis, copy=copy)

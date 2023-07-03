@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 from .apply import df_apply, series_apply
+from .applymap import df_applymap
 from .astype import astype, index_astype
 from .cartesian_chunk import cartesian_chunk
 from .check_monotonic import (
@@ -40,6 +40,8 @@ from .map_chunk import map_chunk
 from .melt import melt
 from .memory_usage import df_memory_usage, index_memory_usage, series_memory_usage
 from .pct_change import pct_change
+from .pivot import df_pivot
+from .pivot_table import df_pivot_table
 from .qcut import qcut
 from .rebalance import rebalance
 from .rechunk import rechunk
@@ -66,6 +68,7 @@ def _install():
         setattr(t, "rechunk", rechunk)
         setattr(t, "describe", describe)
         setattr(t, "apply", df_apply)
+        setattr(t, "applymap", df_applymap)
         setattr(t, "transform", df_transform)
         setattr(t, "isin", df_isin)
         setattr(t, "shift", shift)
@@ -74,6 +77,8 @@ def _install():
         setattr(t, "astype", astype)
         setattr(t, "drop", df_drop)
         setattr(t, "pop", df_pop)
+        setattr(t, "pivot", df_pivot)
+        setattr(t, "pivot_table", df_pivot_table)
         setattr(
             t, "__delitem__", lambda df, items: df_drop(df, items, axis=1, inplace=True)
         )
@@ -146,6 +151,9 @@ def _install():
     for series in SERIES_TYPE:
         series.str = CachedAccessor("str", StringAccessor)
         series.dt = CachedAccessor("dt", DatetimeAccessor)
+
+    for indexes in INDEX_TYPE:
+        indexes.str = CachedAccessor("str", StringAccessor)
 
 
 _install()

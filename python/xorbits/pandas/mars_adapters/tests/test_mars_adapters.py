@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import pandas as pd
+import pytest
 
 from .... import pandas as xpd
 from ....core import DataRef
@@ -118,7 +119,7 @@ def test_string_accessor(setup, dummy_str_series):
     s = dummy_str_series.str.fullmatch("foo")
 
     assert isinstance(s, DataRef)
-    for i, val in s.iteritems():
+    for i, val in s.items():
         assert val == (str(dummy_str_series[i]) == "foo")
 
 
@@ -127,7 +128,7 @@ def test_datetime_accessor(setup, dummy_dt_series):
     s = dummy_dt_series.dt.second
 
     assert isinstance(s, DataRef)
-    for i, val in s.iteritems():
+    for i, val in s.items():
         assert val == i
 
 
@@ -136,7 +137,7 @@ def test_dataframe_getitem(setup, dummy_df):
     assert isinstance(foo, DataRef)
 
     idx = 0
-    for i, val in foo.iteritems():
+    for i, val in foo.items():
         assert idx == i
         assert idx == val
         idx += 1
@@ -148,7 +149,7 @@ def test_dataframe_setitem(setup, dummy_df):
     assert isinstance(baz, DataRef)
 
     idx = 0
-    for i, val in baz.iteritems():
+    for i, val in baz.items():
         assert idx == i
         assert val == float(idx)
         idx += 1
@@ -159,9 +160,21 @@ def test_dataframe_getattr(setup, dummy_df):
     assert isinstance(foo, DataRef)
 
     idx = 0
-    for i, val in foo.iteritems():
+    for i, val in foo.items():
         assert idx == i
         assert idx == val
+        idx += 1
+
+
+def test_dataframe_getattr_id(setup, dummy_df):
+    dummy_df["id"] = (0.0, 1.0, 2.0)
+    id_values = dummy_df.id
+    assert isinstance(id_values, DataRef)
+
+    idx = 0
+    for i, val in id_values.items():
+        assert idx == i
+        assert val == float(idx)
         idx += 1
 
 
@@ -171,8 +184,33 @@ def test_dataframe_setattr(setup, dummy_df):
 
     dummy_df.columns = ["c1", "c2"]
     assert ["c1", "c2"] == list(dummy_df.dtypes.index)
+    dummy_df.c1 = (0.0, 1.0, 2.0)
+    c1 = dummy_df.c1
+    assert isinstance(c1, DataRef)
+    with pytest.warns(
+        UserWarning,
+        match="xorbits.pandas doesn't allow columns to be created via a new attribute name.",
+    ):
+        dummy_df.baz = (0.0, 1.0, 2.0)
+    assert not isinstance(dummy_df.baz, DataRef)
+
+
+def test_dataframe_initializer(setup, dummy_df):
+    df = pd.DataFrame(
+        [[dummy_df["foo"].max(), dummy_df["foo"].min()]], columns=["max_col", "min_col"]
+    )
+    assert df["max_col"][0] == 2
+    assert df["min_col"][0] == 0
 
 
 def test_dataframe_items(setup, dummy_df):
     for label, content in dummy_df.items():
         assert isinstance(content, DataRef)
+
+
+def test_series_tolist(setup, dummy_int_series):
+    lis = dummy_int_series.tolist()
+    idx = 1
+    for i in range(0, len(lis)):
+        assert idx == lis[i]
+        idx += 1

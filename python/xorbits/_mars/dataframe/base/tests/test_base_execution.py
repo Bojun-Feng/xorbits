@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import random
+import string
 from collections import OrderedDict
 
 import numpy as np
@@ -540,6 +541,338 @@ def test_apply_with_arrow_dtype_execution(setup):
     result = r.execute().fetch()
     expected = s1.apply(lambda x: x + "_suffix")
     pd.testing.assert_series_equal(result, expected)
+
+
+def test_data_frame_applymap_execute(setup):
+    # TODO: support GPU for appltmap operation
+    # test one chunk
+    df_raw = pd.DataFrame([[1, 2.12], [3.356, 4.567]])
+    df = from_pandas_df(df_raw, chunk_size=4)
+
+    r = df.applymap(lambda x: len(str(x)))
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: len(str(x)))
+    pd.testing.assert_frame_equal(result, expected)
+
+    r = df.applymap(np.sqrt)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(np.sqrt)
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test multiple chunks
+    df_raw = pd.DataFrame(np.random.rand(10, 2))
+    df = from_pandas_df(df_raw, chunk_size=3)
+
+    r = df.applymap(lambda x: len(str(x)))
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: len(str(x)))
+    pd.testing.assert_frame_equal(result, expected)
+
+    r = df.applymap(np.square)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(np.square)
+    pd.testing.assert_frame_equal(result, expected)
+
+    r = df.applymap(np.sqrt, na_action="ignore", skip_infer=True)
+    result = r.execute().fetch()
+    excepted = df_raw.applymap(np.sqrt, na_action="ignore")
+    pd.testing.assert_frame_equal(result, excepted)
+
+    df_raw = pd.DataFrame([[1.0, 2.0], [3.0, 4.0]])
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    r = df.applymap(lambda x: int(x))
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: int(x))
+    pd.testing.assert_frame_equal(result, expected)
+
+    r = df.applymap(lambda x: int(x) ** 2 if x > 2 else x * 2)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: int(x) ** 2 if x > 2 else x * 2)
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test with strings and numbers
+    df_raw = pd.DataFrame([["a", 1], ["b", 2]])
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    r = df.applymap(lambda x: str(x))
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: str(x))
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test with timestamp
+    df_raw = pd.DataFrame([[pd.Timestamp.now(), 2], [pd.Timestamp.now(), 3]])
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    r = df.applymap(lambda x: str(x))
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: str(x))
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test na_action with different data types
+    df_raw = pd.DataFrame(
+        [[pd.NA, 2.12], [3.356, "hello"], [pd.Timestamp.now(), 4.567]]
+    )
+    df = from_pandas_df(df_raw, chunk_size=3)
+
+    r = df.applymap(lambda x: len(str(x)), na_action="ignore", skip_infer=True)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: len(str(x)), na_action="ignore")
+    pd.testing.assert_frame_equal(result, expected)
+
+    r = df.applymap(lambda x: str(x), na_action="ignore", skip_infer=True)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: str(x), na_action="ignore")
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test na_action with sqrt on int
+    df_raw = pd.DataFrame([[pd.NA, 2], [3, 4]])
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    r = df.applymap(np.sqrt, na_action="ignore", skip_infer=True)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(np.sqrt, na_action="ignore")
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test skip_infer error
+    with pytest.raises(TypeError):
+        df.applymap(np.sqrt, na_action="ignore").execute()
+
+    # test custom function
+    def custom_func(x):
+        if isinstance(x, float):
+            return int(x)
+        elif isinstance(x, int):
+            return float(x) ** 2
+        elif isinstance(x, str):
+            return len(x)
+        elif isinstance(x, pd.Timestamp):
+            return x.year
+        else:
+            return x
+
+    df_raw = pd.DataFrame([[1.0, "hello"], [3, pd.Timestamp.now()]])
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    r = df.applymap(custom_func)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(custom_func)
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test na_action error
+    with pytest.raises(ValueError):
+        df.applymap(lambda x: len(str(x)), na_action="unknown")
+
+    # test empty dataframe
+    df_raw = pd.DataFrame()
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    r = df.applymap(lambda x: len(str(x)))
+    result = r.execute().fetch()
+    expected = df_raw.applymap(lambda x: len(str(x)))
+    pd.testing.assert_frame_equal(result, expected)
+
+    # test func kwargs input
+    def kw_func(x, dete=False):
+        if dete:
+            return x**2
+        else:
+            return x + 1
+
+    df_raw = pd.DataFrame([[1.0, 2.0], [3.0, 4.0]])
+    df = from_pandas_df(df_raw, chunk_size=2)
+    r = df.applymap(kw_func, dete=True)
+    result = r.execute().fetch()
+    expected = df_raw.applymap(kw_func, dete=True)
+    pd.testing.assert_frame_equal(result, expected)
+
+
+def test_data_frame_pivot_execute(setup):
+    def align_df(df):
+        return df.sort_index(axis=0).sort_index(axis=1)
+
+    df_raw = pd.DataFrame(
+        {
+            "foo": ["one", "one", "one", "two", "two", "two"],
+            "bar": ["A", "B", "C", "A", "B", "C"],
+            "baz": [1, 2, 3, 4, 5, 6],
+            "qux": [10, 20, 30, 40, 50, 60],
+        }
+    )
+    df = from_pandas_df(df_raw, chunk_size=1)
+
+    # test basic pivot
+    r = df.pivot(index="foo", columns="bar", values="baz")
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot(index="foo", columns="bar", values="baz")
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test pivot without values
+    r = df.pivot(index="foo", columns="bar")
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot(index="foo", columns="bar")
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test pivot without index
+    r = df.pivot(columns="foo", values="baz")
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot(columns="foo", values="baz")
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test pivot without values and index
+    r = df.pivot(columns="foo")
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot(columns="foo")
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test pivot with list of inputs
+    r = df.pivot(index=["foo", "qux"], columns=["bar", "baz"], values=["baz", "qux"])
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot(
+        index=["foo", "qux"], columns=["bar", "baz"], values=["baz", "qux"]
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test one chunk
+    df = from_pandas_df(df_raw)
+    r = df.pivot(index=["foo", "qux"], columns=["bar", "baz"], values=["baz", "qux"])
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot(
+        index=["foo", "qux"], columns=["bar", "baz"], values=["baz", "qux"]
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+
+def test_data_frame_pivot_table_execute(setup):
+    def align_df(df):
+        return df.sort_index(axis=0).sort_index(axis=1).astype(float)
+
+    df_raw = pd.DataFrame(
+        {
+            "A": ["foo", "foo", "foo", "foo", "foo", "bar", "bar", "bar", "bar"],
+            "B": ["one", "one", "one", "two", "two", "one", "one", "two", "two"],
+            "C": [
+                "small",
+                "large",
+                "large",
+                "small",
+                "small",
+                "large",
+                "small",
+                "small",
+                "large",
+            ],
+            "D": [1, 2, 2, 3, 3, 4, 5, 6, 7],
+            "E": [2, 4, 5, 5, 6, 6, 8, 9, 9],
+        }
+    )
+
+    df = from_pandas_df(df_raw, chunk_size=2)
+
+    # test basic pivot_table
+    r = df.pivot_table(values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum)
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot_table(
+        values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test fill value
+    r = df.pivot_table(
+        values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum, fill_value=0
+    )
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot_table(
+        values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum, fill_value=0
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test multi-value and multi-index
+    r = df.pivot_table(
+        values=["D", "E"], index=["A", "C"], aggfunc={"D": np.mean, "E": np.mean}
+    )
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot_table(
+        values=["D", "E"], index=["A", "C"], aggfunc={"D": np.mean, "E": np.mean}
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test multiple aggfunc
+    def range_func(data):
+        return data.max() - data.min()
+
+    r = df.pivot_table(
+        values=["D", "E"],
+        index=["A", "C"],
+        aggfunc={"D": [range_func, np.mean], "E": [min, max, np.mean]},
+    )
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot_table(
+        values=["D", "E"],
+        index=["A", "C"],
+        aggfunc={"D": [range_func, np.mean], "E": [min, max, np.mean]},
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test complex case
+    r = df.pivot_table(
+        values=["D", "E"],
+        index=["A", "B"],
+        columns=["C", "E"],
+        aggfunc=[np.sum, np.mean, lambda x: x.mean() ** 2],
+    )
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot_table(
+        values=["D", "E"],
+        index=["A", "B"],
+        columns=["C", "E"],
+        aggfunc=[np.sum, np.mean, lambda x: x.mean() ** 2],
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test one chunk
+    df = from_pandas_df(df_raw, chunk_size=9)
+    r = df.pivot_table(
+        values=["D", "E"],
+        index=["A", "B"],
+        columns=["C", "E"],
+        aggfunc=[np.sum, np.mean, lambda x: x.mean() ** 2],
+    )
+    result = r.execute(extra_config={"check_dtypes": False}).fetch()
+    expected = df_raw.pivot_table(
+        values=["D", "E"],
+        index=["A", "B"],
+        columns=["C", "E"],
+        aggfunc=[np.sum, np.mean, lambda x: x.mean() ** 2],
+    )
+    pd.testing.assert_frame_equal(align_df(result), align_df(expected))
+
+    # test numpy input of index and columns
+    with pytest.raises(NotImplementedError):
+        r = df.pivot_table(
+            values="D",
+            index=np.array(["A", "C"]),
+            columns=np.array(["C"]),
+            aggfunc=np.sum,
+        )
+
+    # test margins=True
+    with pytest.raises(NotImplementedError):
+        r = df.pivot_table(
+            values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum, margins=True
+        )
+
+    # test dropna=False
+    with pytest.raises(NotImplementedError):
+        r = df.pivot_table(
+            values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum, dropna=False
+        )
+
+    # test observed=True
+    with pytest.raises(NotImplementedError):
+        r = df.pivot_table(
+            values="D", index=["A", "B"], columns=["C"], aggfunc=np.sum, observed=True
+        )
 
 
 def test_transform_execute(setup):
@@ -1309,11 +1642,11 @@ def test_shift_execution(setup):
     # test tshift
     r = df2.tshift(periods=1)
     result = r.execute().fetch()
-    expected = raw2.tshift(periods=1)
+    expected = raw2.shift(periods=1, freq="infer")
     pd.testing.assert_frame_equal(result, expected)
 
     with pytest.raises(ValueError):
-        _ = df.tshift(periods=1)
+        _ = df.shift(periods=1, freq="infer")
 
     # test series
     s = raw.iloc[:, 0]
@@ -2468,4 +2801,59 @@ def test_bloom_filter(setup):
     pd.testing.assert_frame_equal(r2, raw2)
     pd.testing.assert_frame_equal(
         filtered_r[filtered_r["col1"] <= 10], raw1[raw1["col1"] <= 10]
+    )
+
+
+def test_index_str_method(setup):
+    def generate_random_string(length):
+        characters = (
+            string.ascii_letters
+        )  # Includes both uppercase and lowercase letters
+        random_string = "".join(random.choice(characters) for _ in range(length))
+        return random_string
+
+    array_of_strings = []
+    for i in range(1, 10):
+        rand = generate_random_string(100)
+        array_of_strings.append(rand)
+
+    index = pd.Index(array_of_strings)
+    xorbits_index = from_pandas_index(index, chunk_size=5)
+
+    r = xorbits_index.str[:3]
+    result = r.execute().fetch()
+    expected = index.str[:3]
+    pd.testing.assert_index_equal(result, expected)
+
+    # All base Index.str methods supported by now.
+    pd.testing.assert_index_equal(
+        xorbits_index.str.upper().execute().fetch(), index.str.upper()
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.upper().execute().fetch(), index.str.upper()
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.len().execute().fetch(), index.str.len()
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.lower().execute().fetch(), index.str.lower()
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.title().execute().fetch(), index.str.title()
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.strip(",").execute().fetch(), index.str.strip(",")
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.count("S").execute().fetch(), index.str.count("S")
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.replace("S", "s").execute().fetch(),
+        index.str.replace("S", "s"),
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.encode("utf-8").execute().fetch(), index.str.encode("utf-8")
+    )
+    pd.testing.assert_index_equal(
+        xorbits_index.str.capitalize().execute().fetch(), index.str.capitalize()
     )

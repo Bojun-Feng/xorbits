@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import asyncio
 import os
 import uuid
 from typing import Dict, List, Optional, Tuple
@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 from xoscar.serialization import AioDeserializer, AioSerializer
 
 from ..lib.aio import AioFilesystem
-from ..lib.filesystem import FileSystem, get_fs
+from ..lib.filesystem import FileSystem, LocalFileSystem, get_fs
 from ..utils import implements, mod_hash
 from .base import ObjectInfo, StorageBackend, StorageLevel, register_storage_backend
 from .core import StorageFileObject
@@ -149,3 +149,114 @@ class DiskStorage(FileSystemStorage):
     async def setup(cls, **kwargs) -> Tuple[Dict, Dict]:
         kwargs["level"] = StorageLevel.DISK
         return await super().setup(**kwargs)
+
+
+@register_storage_backend
+class AlluxioStorage(FileSystemStorage):
+    name = "alluxio"
+
+    def __init__(
+        self,
+        root_dir: str,
+        local_environ: bool,  # local_environ means standalone mode
+        level: StorageLevel = None,
+        size: int = None,
+    ):
+        self._fs = AioFilesystem(LocalFileSystem())
+        self._root_dirs = [root_dir]
+        self._level = level
+        self._size = size
+        self._local_environ = local_environ
+
+    @classmethod
+    @implements(StorageBackend.setup)
+    async def setup(cls, **kwargs) -> Tuple[Dict, Dict]:
+        kwargs["level"] = StorageLevel.MEMORY
+        root_dir = kwargs.get("root_dir")
+        local_environ = kwargs.get("local_environ")
+        if local_environ:
+            proc = await asyncio.create_subprocess_shell(
+                f"""$ALLUXIO_HOME/bin/alluxio fs mkdir /alluxio-storage
+                $ALLUXIO_HOME/integration/fuse/bin/alluxio-fuse mount {root_dir} /alluxio-storage
+                """
+            )
+            await proc.wait()
+        params = dict(
+            root_dir=root_dir,
+            level=StorageLevel.MEMORY,
+            size=None,
+            local_environ=local_environ,
+        )
+        return params, dict(root_dir=root_dir)
+
+    @staticmethod
+    @implements(StorageBackend.teardown)
+    async def teardown(**kwargs):
+        root_dir = kwargs.get("root_dir")
+        proc = await asyncio.create_subprocess_shell(
+            f"""$ALLUXIO_HOME/integration/fuse/bin/alluxio-fuse unmount {root_dir} /alluxio-storage
+            $ALLUXIO_HOME/bin/alluxio fs rm -R /alluxio-storage
+            """
+        )
+        await proc.wait()
+
+
+@register_storage_backend
+class JuiceFSStorage(FileSystemStorage):
+    name = "juicefs"
+
+    def __init__(
+        self,
+        root_dirs: List[str],
+        in_k8s: bool = False,
+        local_environ: bool = False,  # local_environ means standalone mode
+        level: StorageLevel = None,
+        size: int = None,
+    ):
+        self._root_dirs = root_dirs
+        self._in_k8s = in_k8s
+        if not self._in_k8s:
+            self._fs = AioFilesystem(LocalFileSystem())
+            self._level = level
+            self._size = size
+            self._local_environ = local_environ
+
+    @classmethod
+    @implements(StorageBackend.setup)
+    async def setup(cls, **kwargs) -> Tuple[Dict, Dict]:
+        kwargs["level"] = StorageLevel.MEMORY
+        in_k8s = kwargs.get("in_k8s")
+        root_dirs = kwargs.get("root_dirs")
+        params = dict(
+            root_dirs=root_dirs,
+            level=StorageLevel.MEMORY,
+            size=None,
+        )
+        if not in_k8s:
+            local_environ = kwargs.get("local_environ")
+            metadata_url = kwargs.get("metadata_url", None)
+            if metadata_url is None:
+                raise ValueError(
+                    "For external storage JuiceFS, you must specify the metadata url for its metadata storage, for example 'redis://172.17.0.5:6379/1'."
+                )
+            if local_environ:
+                proc = await asyncio.create_subprocess_shell(
+                    f"""juicefs format {metadata_url} jfs
+                    juicefs mount {metadata_url} {root_dirs[0]} -d
+                    """
+                )
+                await proc.wait()
+            params["local_environ"] = local_environ
+        return params, dict(root_dirs=root_dirs)
+
+    @staticmethod
+    @implements(StorageBackend.teardown)
+    async def teardown(**kwargs):
+        in_k8s = kwargs.get("in_k8s")
+        if not in_k8s:
+            root_dirs = kwargs.get("root_dirs")
+            proc = await asyncio.create_subprocess_shell(
+                f"""juicefs umount {root_dirs[0]}
+                """
+            )
+            await proc.wait()

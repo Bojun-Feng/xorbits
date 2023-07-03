@@ -18,6 +18,8 @@
 
 import functools
 import inspect
+import warnings
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from types import ModuleType
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Type, Union
@@ -31,6 +33,7 @@ from .._mars import stop_server as mars_stop_server
 from .._mars import tensor as mars_tensor
 from .._mars.core import Entity as MarsEntity
 from .._mars.core import OutputType as MarsOutputType
+from .._mars.core.entity.executable import ExecutableTuple
 from .._mars.core.entity.objects import OBJECT_TYPE as MARS_OBJECT_TYPE
 from .._mars.dataframe import DataFrame as MarsDataFrame
 from .._mars.dataframe import Index as MarsIndex
@@ -76,6 +79,7 @@ from .._mars.tensor.lib.index_tricks import MGridClass as MarsMGridClass
 from .._mars.tensor.lib.index_tricks import OGridClass as MarsOGridClass
 from .._mars.tensor.lib.index_tricks import RClass as MarsRClass
 from .data import DATA_MEMBERS, Data, DataRef, DataType
+from .utils.docstring import attach_cls_member_docstring
 
 
 def own_data(mars_entity: MarsEntity) -> bool:
@@ -137,6 +141,143 @@ def register_converter(from_cls_list: List[Type]):
         return cls
 
     return decorate
+
+
+class ClsMethodWrapper(ABC):
+    def __init__(
+        self,
+        func_name: str = "",
+        library_cls: Type = object,
+        fallback_warning: bool = False,
+    ):
+        self.library_cls = library_cls
+        self.func_name = func_name
+        self.fallback_warning = fallback_warning
+
+    @abstractmethod
+    def _generate_fallback_data(self, mars_entity: MarsEntity) -> Any:
+        """
+        let mars entity fallback to data according to the library
+
+        Parameters
+        ----------
+        mars_entity: MarsEntity
+
+        Returns
+        -------
+
+        """
+
+    @abstractmethod
+    def _generate_warning_msg(self, mars_entity: MarsEntity, func_name: str) -> str:
+        """
+        generate fallback warning message according to the library
+
+        Parameters
+        ----------
+        mars_entity: MarsEntity
+        func_name: str
+
+        Returns
+        -------
+        warning_msg: str
+        """
+
+    @abstractmethod
+    def _get_output_type(self, func: Callable) -> MarsOutputType:
+        """
+        get output type according to the library
+
+        Parameters
+        ----------
+        func: Callable
+
+        Returns
+        -------
+        output_type: MarsOutputType
+        """
+
+    @abstractmethod
+    def _get_docstring_src_module(self) -> ModuleType:
+        """
+        get docstring src module according to the library
+        """
+
+    def get_wrapped(self) -> Callable:
+        """
+        wrap pd.DataFrame member functions, np.ndarray methods, and other methods
+
+        returns a callable
+        """
+
+        @functools.wraps(getattr(self.library_cls, self.func_name))
+        def _wrapped(entity: MarsEntity, *args, **kwargs):
+            def _spawn(entity: MarsEntity) -> MarsEntity:
+                """
+                Execute pandas/numpy fallback with mars remote.
+                """
+
+                def execute_func(
+                    mars_entity: MarsEntity, f_name: str, *args, **kwargs
+                ) -> Any:
+                    ret = self._generate_fallback_data(mars_entity)
+                    return getattr(ret, f_name)(*args, **kwargs)
+
+                new_args = (entity, self.func_name) + args
+                ret = mars_remote.spawn(
+                    execute_func, args=new_args, kwargs=kwargs, output_types="object"
+                )
+                return from_mars(ret.execute())
+
+            def _map_chunk(entity: MarsEntity, skip_infer: bool = False) -> MarsEntity:
+                """
+                Execute pandas fallback with map_chunk.
+                """
+                ret = entity.map_chunk(
+                    lambda x, *args, **kwargs: getattr(x, self.func_name)(
+                        *args, **kwargs
+                    ),
+                    args=args,
+                    kwargs=kwargs,
+                    skip_infer=skip_infer,
+                )
+                if skip_infer:
+                    ret = ret.ensure_data()
+                return from_mars(ret)
+
+            warnings.warn(
+                self._generate_warning_msg(entity, self.func_name),
+                RuntimeWarning,
+            )
+
+            # rechunk mars tileable as one chunk
+            one_chunk_entity = entity.rechunk(max(entity.shape))
+
+            if hasattr(one_chunk_entity, "map_chunk"):
+                try:
+                    return _map_chunk(one_chunk_entity, skip_infer=False)
+                except TypeError:
+                    # when infer failed in map_chunk, we would use remote to execute
+                    # or skip inferring
+                    output_type = self._get_output_type(
+                        getattr(self.library_cls, self.func_name)
+                    )
+                    if output_type == MarsOutputType.object:
+                        return _spawn(one_chunk_entity)
+                    else:
+                        # skip_infer = True to avoid TypeError raised by inferring
+                        return _map_chunk(one_chunk_entity, skip_infer=True)
+            else:
+                return _spawn(one_chunk_entity)
+
+        attach_cls_member_docstring(
+            _wrapped,
+            self.func_name,
+            docstring_src_module=self._get_docstring_src_module(),
+            docstring_src_cls=self.library_cls,
+            fallback_warning=self.fallback_warning,
+        )
+        return _wrapped
 
 
 def wrap_magic_method(method_name: str) -> Callable[[Any], Any]:
@@ -255,11 +396,23 @@ def to_mars(inp: Union[DataRef, Tuple, List, Dict]):
         # converters.
         return getattr(inp, "_mars_obj")
     elif isinstance(inp, tuple):
-        return tuple(to_mars(i) for i in inp)
+        if type(inp) is tuple or isinstance(inp, ExecutableTuple):
+            return tuple(to_mars(i) for i in inp)
+        else:
+            # named tuple
+            return type(inp)(*map(to_mars, inp))
     elif isinstance(inp, list):
-        return list(to_mars(i) for i in inp)
+        # in-place modification of list
+        # preserve weak references to list, avoiding access issues
+        for i, item in enumerate(inp):
+            inp[i] = to_mars(item)
+        return inp
     elif isinstance(inp, dict):
-        return dict((k, to_mars(v)) for k, v in inp.items())
+        # in-place modification of dict
+        # preserve weak references to dict, avoiding access issues
+        for k, v in inp.items():
+            inp[k] = to_mars(v)
+        return inp
     else:
         return inp
 
@@ -280,11 +433,23 @@ def from_mars(inp: Union[MarsEntity, Tuple, List, Dict, None]):
     elif type(inp) in _MARS_CLS_TO_CONVERTER:
         return _MARS_CLS_TO_CONVERTER[type(inp)](inp)
     elif isinstance(inp, tuple):
-        return tuple(from_mars(i) for i in inp)
+        if type(inp) is tuple or isinstance(inp, ExecutableTuple):
+            return tuple(from_mars(i) for i in inp)
+        else:
+            # named tuple
+            return type(inp)(*map(from_mars, inp))
     elif isinstance(inp, list):
-        return list(from_mars(i) for i in inp)
+        # in-place modification of list
+        # preserve weak references to list, avoiding access issues
+        for i, item in enumerate(inp):
+            inp[i] = from_mars(item)
+        return inp
     elif isinstance(inp, dict):
-        return dict((k, from_mars(v)) for k, v in inp.items())
+        # in-place modification of dict
+        # preserve weak references to dict, avoiding access issues
+        for k, v in inp.items():
+            inp[k] = from_mars(v)
+        return inp
     elif isinstance(inp, Generator):
         return wrap_generator(inp)
     else:

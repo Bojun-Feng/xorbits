@@ -25,9 +25,15 @@ except ImportError:  # pragma: no cover
 
 from ..core.utils.fallback import unimplemented_func
 from . import accessors, core, groupby, plotting, window
+from ._config import (
+    describe_option,
+    get_option,
+    option_context,
+    reset_option,
+    set_eng_float_format,
+    set_option,
+)
 from .core import DataFrame, Index, Series
-
-PANDAS_MODULE_METHODS: Optional[Dict[str, Callable]] = None
 
 
 def _install():
@@ -42,13 +48,9 @@ def __dir__():
     from .mars_adapters import MARS_DATAFRAME_CALLABLES
     from .pandas_adapters import collect_pandas_module_members
 
-    global PANDAS_MODULE_METHODS
-    import pandas
-
-    if PANDAS_MODULE_METHODS is None:  # pragma: no cover
-        PANDAS_MODULE_METHODS = collect_pandas_module_members(pandas)
-
-    return list(MARS_DATAFRAME_CALLABLES.keys()) + list(PANDAS_MODULE_METHODS.keys())
+    return list(MARS_DATAFRAME_CALLABLES.keys()) + list(
+        collect_pandas_module_members().keys()
+    )
 
 
 def __getattr__(name: str):
@@ -58,16 +60,12 @@ def __getattr__(name: str):
     if name in MARS_DATAFRAME_CALLABLES:
         return MARS_DATAFRAME_CALLABLES[name]
     else:
-        global PANDAS_MODULE_METHODS
         import pandas
-
-        if PANDAS_MODULE_METHODS is None:  # pragma: no cover
-            PANDAS_MODULE_METHODS = collect_pandas_module_members()
 
         if not hasattr(pandas, name):
             raise AttributeError(name)
-        elif name in PANDAS_MODULE_METHODS:
-            return PANDAS_MODULE_METHODS[name]
+        elif name in collect_pandas_module_members():
+            return collect_pandas_module_members()[name]
         else:  # pragma: no cover
             if inspect.ismethod(getattr(pandas, name)):
                 return unimplemented_func

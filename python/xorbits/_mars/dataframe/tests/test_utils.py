@@ -24,10 +24,12 @@ import pytest
 
 from ...config import option_context
 from ...core import tile
-from ...utils import Timer
+from ...tests.core import require_cudf, support_cuda
+from ...utils import Timer, lazy_import
 from ..core import IndexValue
 from ..initializer import DataFrame, Index, Series
 from ..utils import (
+    _get_index_map,
     auto_merge_chunks,
     build_concatenated_rows_frame,
     build_split_idx_to_origin_idx,
@@ -37,12 +39,15 @@ from ..utils import (
     filter_index_value,
     infer_dtypes,
     infer_index_value,
+    is_pandas_2,
     make_dtypes,
     merge_index_value,
     parse_index,
     split_monotonic_index_min_max,
     validate_axis,
 )
+
+cudf = lazy_import("cudf")
 
 
 def test_decide_dataframe_chunks():
@@ -470,9 +475,16 @@ def test_infer_index_value():
 
 
 def test_index_inferred_type():
-    assert Index(pd.Index([1, 2, 3, 4])).inferred_type == "integer"
-    assert Index(pd.Index([1, 2, 3, 4]).astype("uint32")).inferred_type == "integer"
-    assert Index(pd.Index([1.2, 2.3, 4.5])).inferred_type == "floating"
+    if is_pandas_2():
+        assert Index(pd.Index([1, 2, 3, 4]))._dtype == np.dtype("int64")
+        assert Index(pd.Index([1, 2, 3, 4]).astype("uint32"))._dtype == np.dtype(
+            "uint32"
+        )
+        assert Index(pd.Index([1.2, 2.3, 4.5]))._dtype == np.dtype("float")
+    else:
+        assert Index(pd.Index([1, 2, 3, 4])).inferred_type == "integer"
+        assert Index(pd.Index([1, 2, 3, 4]).astype("uint32")).inferred_type == "integer"
+        assert Index(pd.Index([1.2, 2.3, 4.5])).inferred_type == "floating"
     assert (
         Index(pd.IntervalIndex.from_tuples([(0, 1), (2, 3), (4, 5)])).inferred_type
         == "interval"
@@ -539,6 +551,27 @@ def test_fetch_dataframe_corner_data(setup):
         assert corner.to_string(
             max_rows=corner_max_rows, min_rows=min_rows
         ) == pdf.to_string(max_rows=max_rows, min_rows=min_rows)
+
+
+@require_cudf
+def test_fetch_dataframe_corner_data_gpu(setup_gpu):
+    """
+    TODO: this test should be merged with test_fetch_dataframe_corner_data later.
+    """
+    max_rows = pd.get_option("display.max_rows")
+    try:
+        min_rows = pd.get_option("display.min_rows")
+    except KeyError:  # pragma: no cover
+        min_rows = max_rows
+
+    pdf = pd.DataFrame(range(2000))
+    mdf = DataFrame(pdf, chunk_size=1000).to_gpu()
+    mdf.execute()
+    corner = fetch_corner_data(mdf)
+    assert isinstance(corner, pd.DataFrame)
+    assert corner.to_string(
+        max_rows=(corner.shape[0] - 1), min_rows=min_rows
+    ) == pdf.to_string(max_rows=max_rows, min_rows=min_rows)
 
 
 def test_make_dtypes():
@@ -645,3 +678,55 @@ def test_auto_merge_chunks():
     assert isinstance(s2.chunks[1].op, DataFrameConcat)
     assert s2.chunks[1].name == "a"
     assert len(s2.chunks[1].op.inputs) == 2
+
+
+@support_cuda
+def test_index_map(setup_gpu, gpu):
+    df = pd.DataFrame({"a": [1, 2, 3]}, index=[3, 2, 1])
+    if gpu:
+        src = cudf.DataFrame(df)
+    else:
+        src = df
+
+    # ok
+    func1 = lambda x: x + 1
+    actual = _get_index_map(src, func1)
+    expected = df.index.map(func1)
+    if gpu:
+        actual = actual.to_pandas()
+
+    pd.testing.assert_index_equal(actual, expected)
+
+    # change dtype
+    func2 = lambda x: str(x) + "foo"
+    if gpu:
+        # udf compilation failed on GPU
+        with pytest.raises(ValueError):
+            _get_index_map(src, func2)
+    else:
+        actual = _get_index_map(src, func2)
+        expected = df.index.map(func2)
+        pd.testing.assert_index_equal(actual, expected)
+
+    # up dimension
+    func3 = lambda x: (x, x + 1)
+    if gpu:
+        # udf compilation failed on GPU
+        with pytest.raises(ValueError):
+            _get_index_map(src, func3)
+    else:
+        actual = _get_index_map(src, func3)
+        expected = df.index.map(func3)
+        pd.testing.assert_index_equal(actual, expected)
+
+    # test multi index
+    func4 = lambda x: (x[0] + 1, x[1] + 1)
+    if gpu:
+        src.index = cudf.MultiIndex.from_tuples([(1, 2), (3, 4), (5, 6)])
+        with pytest.raises(NotImplementedError):
+            _get_index_map(src, func4)
+    else:
+        src.index = pd.MultiIndex.from_tuples([(1, 2), (3, 4), (5, 6)])
+        actual = _get_index_map(src, func4)
+        expected = df.index.map(func4)
+        pd.testing.assert_index_equal(actual, expected)

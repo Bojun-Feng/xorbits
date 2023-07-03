@@ -174,6 +174,12 @@ def require_cudf(func):
     return func
 
 
+def support_cuda(func):
+    if pytest:
+        func = pytest.mark.cuda(func)
+    return func
+
+
 def require_ray(func):
     if pytest:
         func = pytest.mark.ray(func)
@@ -198,7 +204,12 @@ def require_hadoop(func):
 
 
 def assert_groupby_equal(
-    left, right, sort_keys=False, sort_index=True, with_selection=False
+    left,
+    right,
+    sort_keys=False,
+    sort_index=True,
+    sort_value=False,
+    with_selection=False,
 ):
     if hasattr(left, "groupby_obj"):
         left = left.groupby_obj
@@ -240,8 +251,14 @@ def assert_groupby_equal(
                 right_frame = right_frame[right_selection]
 
         if isinstance(left_frame, pd.DataFrame):
+            if sort_value:
+                left_frame = left_frame.sort_values(by=list(left_frame.columns))
+                right_frame = right_frame.sort_values(by=list(right_frame.columns))
             pd.testing.assert_frame_equal(left_frame, right_frame)
         else:
+            if sort_value:
+                left_frame = left_frame.sort_values()
+                right_frame = right_frame.sort_values()
             pd.testing.assert_series_equal(left_frame, right_frame)
 
 
@@ -473,7 +490,12 @@ class ObjectCheckMixin:
                 f"real name {real.name}"
             )
 
-        self.assert_dtype_consistent(expected.dtype, real.dtype)
+        if hasattr(real, "dtype"):
+            self.assert_dtype_consistent(expected.dtype, real.dtype)
+        else:
+            assert isinstance(real, cudf.core.index.BaseIndex)
+            # cudf multi index doesn't have attribute 'dtype'.
+            self.assert_dtype_consistent(expected.dtype, np.dtype(object))
         self.assert_index_value_consistent(expected.index_value, real)
 
     def assert_categorical_consistent(self, expected, real):

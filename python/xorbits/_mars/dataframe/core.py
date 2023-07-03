@@ -52,6 +52,7 @@ from ..serialization.serializables import (
     OneOfField,
     ReferenceField,
     Serializable,
+    SerializableMeta,
     SeriesField,
     SliceField,
     StringField,
@@ -62,12 +63,22 @@ from ..utils import (
     calc_nsplits,
     ceildiv,
     estimate_pandas_size,
+    lazy_import,
     on_deserialize_shape,
     on_serialize_numpy_type,
     on_serialize_shape,
     tokenize,
 )
-from .utils import ReprSeries, fetch_corner_data, merge_index_value, parse_index
+from .utils import (
+    ReprSeries,
+    fetch_corner_data,
+    is_dataframe,
+    is_pandas_2,
+    merge_index_value,
+    parse_index,
+)
+
+cudf = lazy_import("cudf")
 
 
 class IndexValue(Serializable):
@@ -77,7 +88,29 @@ class IndexValue(Serializable):
 
     __slots__ = ()
 
-    class IndexBase(Serializable):
+    class IndexMeta(SerializableMeta):
+        classmethod
+
+        def __instancecheck__(cls, instance):
+            if not is_pandas_2():
+                return cls in instance.__class__.__mro__
+            else:
+                if cls is IndexValue.Int64Index:
+                    return type(
+                        instance
+                    ) == IndexValue.Index and instance._dtype == np.dtype("int64")
+                elif cls is IndexValue.Float64Index:
+                    return type(
+                        instance
+                    ) == IndexValue.Index and instance._dtype == np.dtype("float64")
+                elif cls is IndexValue.UInt64Index:
+                    return type(
+                        instance
+                    ) == IndexValue.Index and instance._dtype == np.dtype("uinit64")
+                else:
+                    return cls in instance.__class__.__mro__
+
+    class IndexBase(Serializable, metaclass=IndexMeta):
         _key = StringField("key")  # to identify if the index is the same
         _is_monotonic_increasing = BoolField("is_monotonic_increasing")
         _is_monotonic_decreasing = BoolField("is_monotonic_decreasing")
@@ -707,10 +740,14 @@ class IndexChunkData(ChunkData):
             raise TypeError(f"Unknown params: {list(params)}")
 
     @classmethod
-    def get_params_from_data(cls, data: pd.Index) -> Dict[str, Any]:
+    def get_params_from_data(
+        cls, data: "Union[pd.Index, cudf.core.index.BaseIndex]"
+    ) -> Dict[str, Any]:
+        # cudf multi index doesn't have attribute 'dtype'.
+        dtype = getattr(data, "dtype", np.dtype(object))
         return {
             "shape": data.shape,
-            "dtype": data.dtype,
+            "dtype": dtype,
             "index_value": parse_index(data, store_data=False),
             "name": data.name,
         }
@@ -821,7 +858,7 @@ class _BatchedFetcher:
 
 
 class IndexData(HasShapeTileableData, _ToPandasMixin):
-    __slots__ = ()
+    __slots__ = "_cache", "_accessors"
     type_name = "Index"
 
     # optional field
@@ -861,6 +898,7 @@ class IndexData(HasShapeTileableData, _ToPandasMixin):
             _chunks=chunks,
             **kw,
         )
+        self._accessors = dict()
 
     @property
     def params(self) -> Dict[str, Any]:
@@ -1425,11 +1463,9 @@ class SeriesData(_BatchedFetcher, BaseSeriesData):
         dtype = dtype if dtype is not None else tensor.dtype
         return tensor.astype(dtype=dtype, order=order, copy=False)
 
-    def iteritems(self, batch_size=10000, session=None):
+    def items(self, batch_size=10000, session=None):
         for batch_data in self.iterbatch(batch_size=batch_size, session=session):
-            yield from getattr(batch_data, "iteritems")()
-
-    items = iteritems
+            yield from getattr(batch_data, "items")()
 
     def to_dict(self, into=dict, batch_size=10000, session=None):
         fetch_kwargs = dict(batch_size=batch_size)
@@ -1489,7 +1525,7 @@ class Series(HasShapeTileable, _ToPandasMixin):
 
     @index.setter
     def index(self, new_index):
-        self.set_axis(new_index, axis=0, inplace=True)
+        self.set_axis(new_index, axis=0, copy=False)
 
     @property
     def name(self):
@@ -1561,7 +1597,7 @@ class Series(HasShapeTileable, _ToPandasMixin):
     def values(self):
         return self.to_tensor()
 
-    def iteritems(self, batch_size=10000, session=None):
+    def items(self, batch_size=10000, session=None):
         """
         Lazily iterate over (index, value) tuples.
 
@@ -1589,9 +1625,7 @@ class Series(HasShapeTileable, _ToPandasMixin):
         Index : 1, Value : B
         Index : 2, Value : C
         """
-        return self._data.iteritems(batch_size=batch_size, session=session)
-
-    items = iteritems
+        return self._data.items(batch_size=batch_size, session=session)
 
     def to_dict(self, into=dict, batch_size=10000, session=None):
         """
@@ -2264,13 +2298,9 @@ class DataFrame(HasShapeTileable, _ToPandasMixin):
         return self._data.__mars_tensor__(dtype=dtype, order=order)
 
     def __getattr__(self, key):
-        try:
-            return getattr(self._data, key)
-        except AttributeError:
-            if key in self.dtypes:
-                return self[key]
-            else:
-                raise
+        if self.dtypes is not None and key in self.dtypes:
+            return self[key]
+        return getattr(self._data, key)
 
     def __dir__(self):
         result = list(super().__dir__())
@@ -2315,7 +2345,7 @@ class DataFrame(HasShapeTileable, _ToPandasMixin):
 
     @index.setter
     def index(self, new_index):
-        self.set_axis(new_index, axis=0, inplace=True)
+        self.set_axis(new_index, axis=0, copy=False)
 
     @property
     def columns(self):
@@ -2325,7 +2355,7 @@ class DataFrame(HasShapeTileable, _ToPandasMixin):
 
     @columns.setter
     def columns(self, new_columns):
-        self.set_axis(new_columns, axis=1, inplace=True)
+        self.set_axis(new_columns, axis=1, copy=False)
 
     def keys(self):
         """
@@ -3086,7 +3116,7 @@ class DataFrameOrSeriesChunkData(ChunkData):
 
     @classmethod
     def get_params_from_data(cls, data: Any) -> Dict[str, Any]:
-        if isinstance(data, pd.DataFrame):
+        if is_dataframe(data):
             return {
                 "data_type": "dataframe",
                 "data_params": DataFrameChunkData.get_params_from_data(data),

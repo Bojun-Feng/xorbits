@@ -71,13 +71,13 @@ from numpy.lib.index_tricks import ndindex
 
 from ..core.utils.fallback import unimplemented_func
 
-NUMPY_MODULE_METHODS: Optional[Dict[str, Callable]] = None
-
 
 def _install():
-    from .mars_adapters import _install as _install_mars_adapters
+    from .mars_adapters import _install as _install_mars_methods
+    from .numpy_adapters import _install as _install_numpy_methods
 
-    _install_mars_adapters()
+    _install_mars_methods()
+    _install_numpy_methods()
 
 
 try:
@@ -101,40 +101,30 @@ from .core import ndarray
 
 def __dir__():
     from .mars_adapters import MARS_TENSOR_CALLABLES, MARS_TENSOR_OBJECTS
-    from .numpy_adapters import collect_numpy_module_members
-
-    global NUMPY_MODULE_METHODS
-    import numpy
-
-    if NUMPY_MODULE_METHODS is None:  # pragma: no cover
-        NUMPY_MODULE_METHODS = collect_numpy_module_members(numpy)
+    from .numpy_adapters.core import NUMPY_MEMBERS
 
     return (
         list(MARS_TENSOR_CALLABLES.keys())
         + list((MARS_TENSOR_OBJECTS.keys()))
-        + list(NUMPY_MODULE_METHODS.keys())
+        + list(NUMPY_MEMBERS.keys())
     )
 
 
 def __getattr__(name: str):
     from .mars_adapters import MARS_TENSOR_CALLABLES, MARS_TENSOR_OBJECTS
-    from .numpy_adapters import collect_numpy_module_members
+    from .numpy_adapters.core import NUMPY_MEMBERS
 
     if name in MARS_TENSOR_CALLABLES:
         return MARS_TENSOR_CALLABLES[name]
     elif name in MARS_TENSOR_OBJECTS:
         return MARS_TENSOR_OBJECTS[name]
     else:
-        global NUMPY_MODULE_METHODS
         import numpy
-
-        if NUMPY_MODULE_METHODS is None:  # pragma: no cover
-            NUMPY_MODULE_METHODS = collect_numpy_module_members(numpy)
 
         if not hasattr(numpy, name):
             raise AttributeError(name)
-        elif name in NUMPY_MODULE_METHODS:
-            return NUMPY_MODULE_METHODS[name]
+        elif name in NUMPY_MEMBERS:
+            return NUMPY_MEMBERS[name]
         else:  # pragma: no cover
             if inspect.ismethod(getattr(numpy, name)):
                 return unimplemented_func

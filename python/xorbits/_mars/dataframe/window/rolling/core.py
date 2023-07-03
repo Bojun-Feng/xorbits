@@ -24,10 +24,15 @@ from ....serialization.serializables import (
 )
 from ....utils import pd_release_version
 from ...core import DATAFRAME_TYPE
-from ...utils import build_empty_df, build_empty_series, validate_axis
+from ...utils import build_empty_df, build_empty_series, is_pandas_2, validate_axis
 from ..core import Window
 
 _window_has_method = pd_release_version >= (1, 3, 0)
+
+_PAIRWISE_AGG = (
+    "corr",
+    "cov",
+)
 
 
 class Rolling(Window):
@@ -142,20 +147,27 @@ class Rolling(Window):
         for k in self.params:
             # update value according to pandas rolling
             setattr(self, "_" + k, getattr(pd_rolling, k))
+        if is_pandas_2() and pd_rolling._win_freq_i8 is not None:
+            setattr(self, "_win_type", "freq")
 
     def aggregate(self, func, *args, **kwargs):
         from .aggregation import DataFrameRollingAgg
 
+        params = self.params
+        if func in _PAIRWISE_AGG:
+            # for convenience, since pairwise aggregations are axis irrelevant.
+            params["axis"] = 0
+
         op = DataFrameRollingAgg(
-            func=func, func_args=args, func_kwargs=kwargs, **self.params
+            func=func, func_args=args, func_kwargs=kwargs, **params
         )
         return op(self)
 
     def agg(self, func, *args, **kwargs):
         return self.aggregate(func, *args, **kwargs)
 
-    def count(self):
-        return self.aggregate("count")
+    def count(self, *args, **kwargs):
+        return self.aggregate("count", *args, **kwargs)
 
     def sum(self, *args, **kwargs):
         return self.aggregate("sum", *args, **kwargs)
@@ -163,8 +175,8 @@ class Rolling(Window):
     def mean(self, *args, **kwargs):
         return self.aggregate("mean", *args, **kwargs)
 
-    def median(self, **kwargs):
-        return self.aggregate("median", **kwargs)
+    def median(self, *args, **kwargs):
+        return self.aggregate("median", *args, **kwargs)
 
     def var(self, ddof=1, *args, **kwargs):
         return self.aggregate("var", ddof=ddof, *args, **kwargs)
@@ -178,16 +190,19 @@ class Rolling(Window):
     def max(self, *args, **kwargs):
         return self.aggregate("max", *args, **kwargs)
 
-    def skew(self, **kwargs):
-        return self.aggregate("skew", **kwargs)
+    def skew(self, *args, **kwargs):
+        return self.aggregate("skew", *args, **kwargs)
 
-    def kurt(self, **kwargs):
-        return self.aggregate("kurt", **kwargs)
+    def kurt(self, *args, **kwargs):
+        return self.aggregate("kurt", *args, **kwargs)
 
     def corr(self, **kwargs):
-        # for convenience, since the calculation of corr is axis irrelevant.
-        self._axis = 0
+        # not taking positional args since the tiling depends on "pairwise"
         return self.aggregate("corr", **kwargs)
+
+    def cov(self, **kwargs):
+        # not taking positional args since the tiling depends on "pairwise"
+        return self.aggregate("cov", **kwargs)
 
 
 def rolling(

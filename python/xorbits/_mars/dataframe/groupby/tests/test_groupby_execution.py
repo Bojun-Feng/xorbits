@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections import OrderedDict
+from itertools import product
 
 import numpy as np
 import pandas as pd
@@ -26,11 +27,14 @@ except ImportError:  # pragma: no cover
 from .... import dataframe as md
 from ....config import option_context
 from ....core.operand import OperandStage
-from ....tests.core import assert_groupby_equal, require_cudf
-from ....utils import arrow_array_to_objects, pd_release_version
+from ....tests.core import assert_groupby_equal, require_cudf, support_cuda
+from ....utils import arrow_array_to_objects, lazy_import, pd_release_version
 from ...core import DATAFRAME_OR_SERIES_TYPE
+from ...utils import is_pandas_2
 from ..aggregation import DataFrameGroupByAgg
+from ..rolling import _PAIRWISE_AGG
 
+cudf = lazy_import("cudf")
 pytestmark = pytest.mark.pd_compat
 
 _agg_size_as_frame = pd_release_version[:2] > (1, 0)
@@ -52,24 +56,24 @@ def test_groupby(setup):
 
     # test groupby with DataFrames and RangeIndex
     df1 = pd.DataFrame(data_dict)
-    mdf = md.DataFrame(df1, chunk_size=13)
-    grouped = mdf.groupby("b")
+    mdf1 = md.DataFrame(df1, chunk_size=13)
+    grouped = mdf1.groupby("b")
     assert_groupby_equal(grouped.execute().fetch(), df1.groupby("b"))
 
     # test groupby with string index with duplications
     df2 = pd.DataFrame(data_dict, index=["i" + str(i % 3) for i in range(data_size)])
-    mdf = md.DataFrame(df2, chunk_size=13)
-    grouped = mdf.groupby("b")
+    mdf2 = md.DataFrame(df2, chunk_size=13)
+    grouped = mdf2.groupby("b")
     assert_groupby_equal(grouped.execute().fetch(), df2.groupby("b"))
 
     # test groupby with DataFrames by series
-    grouped = mdf.groupby(mdf["b"])
-    assert_groupby_equal(grouped.execute().fetch(), df2.groupby(df2["b"]))
+    grouped = mdf1.groupby(mdf1["b"])
+    assert_groupby_equal(grouped.execute().fetch(), df1.groupby(df1["b"]))
 
     # test groupby with DataFrames by multiple series
-    grouped = mdf.groupby(by=[mdf["b"], mdf["c"]])
+    grouped = mdf1.groupby(by=[mdf1["b"], mdf1["c"]])
     assert_groupby_equal(
-        grouped.execute().fetch(), df2.groupby(by=[df2["b"], df2["c"]])
+        grouped.execute().fetch(), df1.groupby(by=[df1["b"], df1["c"]])
     )
 
     # test groupby with DataFrames with MultiIndex
@@ -172,6 +176,7 @@ def test_groupby_getitem(setup):
     pd.testing.assert_frame_equal(
         r.execute().fetch().sort_index(),
         raw.groupby("b")[["a", "b"]].apply(lambda x: x + 1).sort_index(),
+        check_names=False,
     )
 
     r = mdf.groupby("b")[["a", "b"]].transform(lambda x: x + 1)
@@ -203,7 +208,10 @@ def test_groupby_getitem(setup):
 
         r = mdf.groupby("b", as_index=False).a.sum(method=method)
         pd.testing.assert_frame_equal(
-            r.execute().fetch().sort_values("b", ignore_index=True),
+            r.execute()
+            .fetch()
+            .sort_values("b", ignore_index=True)
+            .reset_index(drop=True),
             raw.groupby("b", as_index=False)
             .a.sum()
             .sort_values("b", ignore_index=True),
@@ -224,7 +232,12 @@ def test_groupby_getitem(setup):
         pd.testing.assert_frame_equal(result, expected)
 
         r = mdf.groupby("b", as_index=False).b.agg({"cnt": "count"}, method=method)
-        result = r.execute().fetch().sort_values("b", ignore_index=True)
+        result = (
+            r.execute()
+            .fetch()
+            .sort_values("b", ignore_index=True)
+            .reset_index(drop=True)
+        )
         try:
             expected = (
                 raw.groupby("b", as_index=False)
@@ -241,6 +254,7 @@ def test_groupby_getitem(setup):
     pd.testing.assert_series_equal(
         r.execute().fetch().sort_index(),
         raw.groupby("b").a.apply(lambda x: x + 1).sort_index(),
+        check_names=False,
     )
 
     r = mdf.groupby("b").a.transform(lambda x: x + 1)
@@ -392,10 +406,10 @@ def test_dataframe_groupby_agg(setup):
             )
 
             # test groupby series
-            r = mdf.groupby(mdf["c2"], sort=sort).sum(method=method)
+            r = mdf.groupby(mdf["c2"], sort=sort).sum(method=method, numeric_only=True)
             pd.testing.assert_frame_equal(
                 r.execute().fetch().sort_index(),
-                raw.groupby(raw["c2"]).sum().sort_index(),
+                raw.groupby(raw["c2"]).sum(numeric_only=True).sort_index(),
             )
 
     r = mdf.groupby("c2").size(method="tree")
@@ -440,10 +454,14 @@ def test_dataframe_groupby_agg(setup):
 
         r = mdf.groupby(["c1", "c2"], as_index=False).agg("mean", method=method)
         pd.testing.assert_frame_equal(
-            r.execute().fetch().sort_values(["c1", "c2"], ignore_index=True),
+            r.execute()
+            .fetch()
+            .sort_values(["c1", "c2"], ignore_index=True)
+            .reset_index(drop=True),
             raw.groupby(["c1", "c2"], as_index=False)
             .agg("mean")
-            .sort_values(["c1", "c2"], ignore_index=True),
+            .sort_values(["c1", "c2"], ignore_index=True)
+            .reset_index(drop=True),
         )
         assert r.op.groupby_params["as_index"] is False
 
@@ -545,8 +563,10 @@ def test_dataframe_groupby_agg_sort(setup):
         )
 
         # test groupby series
-        r = mdf.groupby(mdf["c2"]).sum(method=method)
-        pd.testing.assert_frame_equal(r.execute().fetch(), raw.groupby(raw["c2"]).sum())
+        r = mdf.groupby(mdf["c2"]).sum(method=method, numeric_only=True)
+        pd.testing.assert_frame_equal(
+            r.execute().fetch(), raw.groupby(raw["c2"]).sum(numeric_only=True)
+        )
 
     r = mdf.groupby("c2").size(method="tree")
     pd.testing.assert_series_equal(r.execute().fetch(), raw.groupby("c2").size())
@@ -826,7 +846,8 @@ def test_gpu_groupby_agg(setup_gpu):
     )
 
 
-def test_groupby_apply(setup):
+@support_cuda
+def test_groupby_apply(setup_gpu, gpu):
     df1 = pd.DataFrame(
         {
             "a": [3, 4, 5, 3, 5, 4, 1, 2, 3],
@@ -851,30 +872,59 @@ def test_groupby_apply(setup):
             s = s.iloc[:-1]
         return s
 
-    mdf = md.DataFrame(df1, chunk_size=3)
+    mdf = md.DataFrame(df1, gpu=gpu, chunk_size=3)
 
-    applied = mdf.groupby("b").apply(lambda df: None)
-    pd.testing.assert_frame_equal(
-        applied.execute().fetch(), df1.groupby("b").apply(lambda df: None)
-    )
+    # Pandas is not compatible with the results of cudf in this case
+    # cudf return a series, however, pandas returns empty dataframe.
+    # So gpu is not tested here.
+    if not gpu:
+        applied = mdf.groupby("b").apply(lambda df: None)
+        pd.testing.assert_frame_equal(
+            applied.execute().fetch(), df1.groupby("b").apply(lambda df: None)
+        )
 
+    # For the index of result in this case, pandas is not compatible with cudf.
+    # See ``Pandas Compatibility Note`` in cudf doc:
+    # https://docs.rapids.ai/api/cudf/stable/api_docs/api/cudf.core.groupby.groupby.groupby.apply/
     applied = mdf.groupby("b").apply(apply_df)
-    pd.testing.assert_frame_equal(
-        applied.execute().fetch().sort_index(),
-        df1.groupby("b").apply(apply_df).sort_index(),
-    )
+    if gpu:
+        cdf = cudf.DataFrame(df1)
+        cudf.testing.assert_frame_equal(
+            applied.execute().fetch(to_cpu=False).sort_index(),
+            cdf.groupby("b").apply(apply_df).sort_index(),
+        )
+    else:
+        pd.testing.assert_frame_equal(
+            applied.execute().fetch().sort_index(),
+            df1.groupby("b").apply(apply_df).sort_index(),
+        )
 
-    applied = mdf.groupby("b").apply(apply_df, ret_series=True)
-    pd.testing.assert_frame_equal(
-        applied.execute().fetch().sort_index(),
-        df1.groupby("b").apply(apply_df, ret_series=True).sort_index(),
-    )
+    # For this case, cudf groupby apply method do not receive kwargs.
+    # Also, cudf does not handle as_index is True.
+    # So here only determine whether the results are consistent with cudf.
+    if gpu:
+        cdf = cudf.DataFrame(df1)
+        applied = mdf.groupby("b").apply(apply_df, True)
+        cudf.testing.assert_frame_equal(
+            applied.execute().fetch(to_cpu=False).sort_index(),
+            cdf.groupby("b").apply(apply_df, True).sort_index(),
+        )
+    else:
+        applied = mdf.groupby("b").apply(apply_df, ret_series=True)
+        pd.testing.assert_frame_equal(
+            applied.execute().fetch().sort_index(),
+            df1.groupby("b").apply(apply_df, ret_series=True).sort_index(),
+        )
 
-    applied = mdf.groupby("b").apply(lambda df: df.a, output_type="series")
-    pd.testing.assert_series_equal(
-        applied.execute().fetch().sort_index(),
-        df1.groupby("b").apply(lambda df: df.a).sort_index(),
-    )
+    # For this case, cudf does not handle as_index is True,
+    # resulting in a mismatch between the output type and the actual type.
+    # Therefore, just test cpu here.
+    if not gpu:
+        applied = mdf.groupby("b").apply(lambda df: df.a, output_type="series")
+        pd.testing.assert_series_equal(
+            applied.execute().fetch().sort_index(),
+            df1.groupby("b").apply(lambda df: df.a).sort_index(),
+        )
 
     applied = mdf.groupby("b").apply(lambda df: df.a.sum())
     pd.testing.assert_series_equal(
@@ -883,32 +933,43 @@ def test_groupby_apply(setup):
     )
 
     series1 = pd.Series([3, 4, 5, 3, 5, 4, 1, 2, 3])
-    ms1 = md.Series(series1, chunk_size=3)
+    ms1 = md.Series(series1, gpu=gpu, chunk_size=3)
 
     applied = ms1.groupby(lambda x: x % 3).apply(lambda df: None)
     pd.testing.assert_series_equal(
-        applied.execute().fetch(),
-        series1.groupby(lambda x: x % 3).apply(lambda df: None),
+        applied.execute().fetch().sort_index(),
+        series1.groupby(lambda x: x % 3).apply(lambda df: None).sort_index(),
     )
 
+    # For this case, ``group_keys`` option does not take effect in cudf
     applied = ms1.groupby(lambda x: x % 3).apply(apply_series)
-    pd.testing.assert_series_equal(
-        applied.execute().fetch().sort_index(),
-        series1.groupby(lambda x: x % 3).apply(apply_series).sort_index(),
-    )
+    if gpu:
+        cs = cudf.Series(series1)
+        cudf.testing.assert_series_equal(
+            applied.execute().fetch(to_cpu=False).sort_index(),
+            cs.groupby(lambda x: x % 3).apply(apply_series).sort_index(),
+        )
+    else:
+        pd.testing.assert_series_equal(
+            applied.execute().fetch().sort_index(),
+            series1.groupby(lambda x: x % 3).apply(apply_series).sort_index(),
+        )
 
     sindex2 = pd.MultiIndex.from_arrays([list(range(9)), list("ABCDEFGHI")])
     series2 = pd.Series(list("CDECEDABC"), index=sindex2)
-    ms2 = md.Series(series2, chunk_size=3)
+    ms2 = md.Series(series2, gpu=gpu, chunk_size=3)
 
-    applied = ms2.groupby(lambda x: x[0] % 3).apply(apply_series)
-    pd.testing.assert_series_equal(
-        applied.execute().fetch().sort_index(),
-        series2.groupby(lambda x: x[0] % 3).apply(apply_series).sort_index(),
-    )
+    # do not test multi index on gpu for now
+    if not gpu:
+        applied = ms2.groupby(lambda x: x[0] % 3).apply(apply_series)
+        pd.testing.assert_series_equal(
+            applied.execute().fetch().sort_index(),
+            series2.groupby(lambda x: x[0] % 3).apply(apply_series).sort_index(),
+        )
 
 
-def test_groupby_apply_with_df_or_series_output(setup):
+@support_cuda
+def test_groupby_apply_with_df_or_series_output(setup_gpu, gpu):
     raw = pd.DataFrame(
         {
             "a": [3, 4, 5, 3, 5, 4, 1, 2, 3],
@@ -916,7 +977,7 @@ def test_groupby_apply_with_df_or_series_output(setup):
             "c": list("aabaabbbb"),
         }
     )
-    mdf = md.DataFrame(raw, chunk_size=3)
+    mdf = md.DataFrame(raw, gpu=gpu, chunk_size=3)
 
     def f1(df):
         return df.a.iloc[2]
@@ -928,7 +989,7 @@ def test_groupby_apply_with_df_or_series_output(setup):
         mdf.groupby("c").apply(f1, output_types=["df_or_series"]).execute()
 
     for kwargs in [dict(output_type="df_or_series"), dict(skip_infer=True)]:
-        mdf = md.DataFrame(raw, chunk_size=5)
+        mdf = md.DataFrame(raw, gpu=gpu, chunk_size=5)
         applied = mdf.groupby("c").apply(f1, **kwargs)
         assert isinstance(applied, DATAFRAME_OR_SERIES_TYPE)
         applied = applied.execute()
@@ -942,7 +1003,7 @@ def test_groupby_apply_with_df_or_series_output(setup):
     def f2(df):
         return df[["a"]]
 
-    mdf = md.DataFrame(raw, chunk_size=5)
+    mdf = md.DataFrame(raw, gpu=gpu, chunk_size=5)
     applied = mdf.groupby("c").apply(f2, output_types=["df_or_series"])
     assert isinstance(applied, DATAFRAME_OR_SERIES_TYPE)
     applied = applied.execute()
@@ -954,7 +1015,8 @@ def test_groupby_apply_with_df_or_series_output(setup):
     pd.testing.assert_frame_equal(applied.fetch().sort_index(), expected.sort_index())
 
 
-def test_groupby_apply_closure(setup):
+@support_cuda
+def test_groupby_apply_closure(setup_gpu, gpu):
     # DataFrame
     df1 = pd.DataFrame(
         {
@@ -986,7 +1048,7 @@ def test_groupby_apply_closure(setup):
         def __call__(self, s):
             return s.mean() * y
 
-    mdf = md.DataFrame(df1, chunk_size=3)
+    mdf = md.DataFrame(df1, gpu=gpu, chunk_size=3)
 
     applied = mdf.groupby("b").apply(apply_closure_df)
     pd.testing.assert_series_equal(
@@ -1003,7 +1065,7 @@ def test_groupby_apply_closure(setup):
 
     # Series
     series1 = pd.Series([3, 4, 5, 3, 5, 4, 1, 2, 3])
-    ms1 = md.Series(series1, chunk_size=3)
+    ms1 = md.Series(series1, gpu=gpu, chunk_size=3)
 
     applied = ms1.groupby(lambda x: x % 3).apply(apply_closure_series)
     pd.testing.assert_series_equal(
@@ -1017,6 +1079,42 @@ def test_groupby_apply_closure(setup):
         applied.execute().fetch().sort_index(),
         series1.groupby(lambda x: x % 3).apply(cs).sort_index(),
     )
+
+
+@support_cuda
+@pytest.mark.parametrize(
+    "chunked,as_index", [(True, True), (True, False), (False, True), (False, False)]
+)
+def test_groupby_apply_as_index(chunked, as_index, setup_gpu, gpu):
+    df = pd.DataFrame(
+        {
+            "a": list(range(1, 11)),
+            "b": list(range(1, 11))[::-1],
+            "c": list("aabbccddac"),
+        }
+    )
+
+    def udf(v):
+        denominator = v["a"].sum() * v["a"].mean()
+        v = v[v["c"] == "c"]
+        numerator = v["a"].sum()
+        return numerator / float(denominator)
+
+    chunk_size = 3 if chunked else None
+    mdf = md.DataFrame(df, gpu=gpu, chunk_size=chunk_size)
+    applied = mdf.groupby("b", as_index=as_index).apply(udf)
+    actual = applied.execute().fetch()
+    expected = df.groupby("b", as_index=as_index).apply(udf)
+
+    # cannot ensure the index for this case
+    if chunked is True and as_index is False:
+        actual = actual.sort_values(by="b").reset_index(drop=True)
+        expected = expected.sort_values(by="b").reset_index(drop=True)
+
+    if isinstance(expected, pd.DataFrame):
+        pd.testing.assert_frame_equal(actual.sort_index(), expected.sort_index())
+    else:
+        pd.testing.assert_series_equal(actual.sort_index(), expected.sort_index())
 
 
 def test_groupby_transform(setup):
@@ -1070,24 +1168,33 @@ def test_groupby_transform(setup):
     )
 
     if pd.__version__ != "1.1.0":
-        r = mdf.groupby("b").transform(["cummax", "cumsum"], _call_agg=True)
+        df3 = pd.DataFrame(
+            {
+                "a": [3, 4, 5, 3, 5, 4, 1, 2, 3],
+                "b": [1, 3, 4, 5, 6, 5, 4, 4, 4],
+                "c": [1, 3, 4, 5, 6, 5, 4, 4, 4],
+            }
+        )
+        mdf3 = md.DataFrame(df3, chunk_size=3)
+
+        r = mdf3.groupby("b").transform(["cummax", "cumsum"], _call_agg=True)
         pd.testing.assert_frame_equal(
             r.execute().fetch().sort_index(),
-            df1.groupby("b").agg(["cummax", "cumsum"]).sort_index(),
+            df3.groupby("b").agg(["cummax", "cumsum"]).sort_index(),
         )
 
         agg_list = ["cummax", "cumsum"]
-        r = mdf.groupby("b").transform(agg_list, _call_agg=True)
+        r = mdf3.groupby("b").transform(agg_list, _call_agg=True)
         pd.testing.assert_frame_equal(
             r.execute().fetch().sort_index(),
-            df1.groupby("b").agg(agg_list).sort_index(),
+            df3.groupby("b").agg(agg_list).sort_index(),
         )
 
-        agg_dict = OrderedDict([("d", "cummax"), ("b", "cumsum")])
-        r = mdf.groupby("b").transform(agg_dict, _call_agg=True)
+        agg_dict = OrderedDict([("a", "cummax"), ("c", "cumsum")])
+        r = mdf3.groupby("b").transform(agg_dict, _call_agg=True)
         pd.testing.assert_frame_equal(
             r.execute().fetch().sort_index(),
-            df1.groupby("b").agg(agg_dict).sort_index(),
+            df3.groupby("b").agg(agg_dict).sort_index(),
         )
 
     agg_list = ["sum", lambda s: s.sum()]
@@ -1191,11 +1298,12 @@ def test_groupby_fill(setup):
         getattr(df1.groupby("one"), "fillna")(5).sort_index(),
     )
 
-    r4 = getattr(mdf.groupby("two"), "backfill")()
-    pd.testing.assert_frame_equal(
-        r4.execute().fetch().sort_index(),
-        getattr(df1.groupby("two"), "backfill")().sort_index(),
-    )
+    if not is_pandas_2():
+        r4 = getattr(mdf.groupby("two"), "backfill")()
+        pd.testing.assert_frame_equal(
+            r4.execute().fetch().sort_index(),
+            getattr(df1.groupby("two"), "backfill")().sort_index(),
+        )
 
     s1 = pd.Series([4, 3, 9, np.nan, np.nan, 7, 10, 8, 1, 6])
     ms1 = md.Series(s1, chunk_size=3)
@@ -1212,11 +1320,12 @@ def test_groupby_fill(setup):
         getattr(s1.groupby(lambda x: x % 2), "bfill")().sort_index(),
     )
 
-    r4 = getattr(ms1.groupby(lambda x: x % 2), "backfill")()
-    pd.testing.assert_series_equal(
-        r4.execute().fetch().sort_index(),
-        getattr(s1.groupby(lambda x: x % 2), "backfill")().sort_index(),
-    )
+    if not is_pandas_2():
+        r4 = getattr(ms1.groupby(lambda x: x % 2), "backfill")()
+        pd.testing.assert_series_equal(
+            r4.execute().fetch().sort_index(),
+            getattr(s1.groupby(lambda x: x % 2), "backfill")().sort_index(),
+        )
 
 
 def test_groupby_head(setup):
@@ -1239,9 +1348,9 @@ def test_groupby_head(setup):
     pd.testing.assert_frame_equal(
         r.execute().fetch().sort_index(), df1.groupby("b").head(-1)
     )
-    r = mdf.groupby("b")["a", "c"].head(1)
+    r = mdf.groupby("b")[["a", "c"]].head(1)
     pd.testing.assert_frame_equal(
-        r.execute().fetch().sort_index(), df1.groupby("b")["a", "c"].head(1)
+        r.execute().fetch().sort_index(), df1.groupby("b")[["a", "c"]].head(1)
     )
 
     # test multiple chunks
@@ -1258,13 +1367,13 @@ def test_groupby_head(setup):
     )
 
     # test head with selection
-    r = mdf.groupby("b")["a", "d"].head(1)
+    r = mdf.groupby("b")[["a", "d"]].head(1)
     pd.testing.assert_frame_equal(
-        r.execute().fetch().sort_index(), df1.groupby("b")["a", "d"].head(1)
+        r.execute().fetch().sort_index(), df1.groupby("b")[["a", "d"]].head(1)
     )
-    r = mdf.groupby("b")["c", "a", "d"].head(1)
+    r = mdf.groupby("b")[["c", "a", "d"]].head(1)
     pd.testing.assert_frame_equal(
-        r.execute().fetch().sort_index(), df1.groupby("b")["c", "a", "d"].head(1)
+        r.execute().fetch().sort_index(), df1.groupby("b")[["c", "a", "d"]].head(1)
     )
     r = mdf.groupby("b")["c"].head(1)
     pd.testing.assert_series_equal(
@@ -1465,9 +1574,10 @@ def test_groupby_apply_with_arrow_dtype(setup):
 
     applied = mseries.groupby(mseries).apply(lambda s: s)
     result = applied.execute().fetch()
-    result.index = result.index.astype(np.int64)
     expected = series1.groupby(series1).apply(lambda s: s)
-    pd.testing.assert_series_equal(arrow_array_to_objects(result), expected)
+    pd.testing.assert_series_equal(
+        arrow_array_to_objects(result), expected, check_index_type=False
+    )
 
 
 def test_groupby_nunique(setup):
@@ -1514,3 +1624,265 @@ def test_groupby_nunique(setup):
             .nunique()
             .sort_values(by="b", ignore_index=True),
         )
+
+
+def _generate_params_for_gpu():
+    for data_type in ("df", "series"):
+        for chunked in (False, True):
+            for as_index in (False, True):
+                for sort in (False, True):
+                    yield data_type, chunked, as_index, sort
+
+
+@require_cudf
+@pytest.mark.parametrize(
+    "data_type,chunked,as_index,sort",
+    _generate_params_for_gpu(),
+)
+def test_gpu_groupby_size(data_type, chunked, as_index, sort, setup_gpu):
+    data1 = [i + 1 for i in range(20)]
+    data2 = [i * 2 + 1 for i in range(20)]
+    data = {"a": data1, "b": data2}
+
+    if data_type == "df":
+        df = pd.DataFrame(data)
+        expected = df.groupby(["a"], as_index=as_index, sort=sort).size()
+    else:
+        series = pd.Series(data1 + data2)
+        if not as_index and data_type == "series":
+            with pytest.raises(Exception):
+                series.groupby(level=0, as_index=as_index, sort=sort).size()
+            pytest.skip(
+                "Skip this since pandas series groupby not support as_index=False"
+            )
+        expected = series.groupby(level=0, as_index=as_index, sort=sort).size()
+
+    chunk_size = 3 if chunked else None
+
+    if data_type == "df":
+        mdf = md.DataFrame(data, chunk_size=chunk_size).to_gpu()
+        res = mdf.groupby(["a"], as_index=as_index, sort=sort).size()
+    else:
+        series = md.Series(data1 + data2, chunk_size=chunk_size).to_gpu()
+        res = series.groupby(level=0, as_index=as_index, sort=sort).size()
+    actual = res.execute().fetch(to_cpu=False).to_pandas()
+
+    if isinstance(expected, pd.DataFrame):
+        # cudf groupby size not ensure order
+        actual = actual.sort_values(by="a").reset_index(drop=True)
+        pd.testing.assert_frame_equal(expected, actual)
+    else:
+        actual = actual.sort_index()
+        pd.testing.assert_series_equal(expected, actual)
+
+
+@support_cuda
+@pytest.mark.parametrize(
+    "as_index",
+    [True, False],
+)
+def test_groupby_agg_on_same_funcs(setup_gpu, as_index, gpu):
+    rs = np.random.RandomState(0)
+    df = pd.DataFrame(
+        {
+            "a": rs.choice(["foo", "bar", "baz"], size=100),
+            "b": rs.choice(["foo", "bar", "baz"], size=100),
+            "c": rs.choice(["foo", "bar", "baz"], size=100),
+        },
+    )
+
+    mdf = md.DataFrame(df, chunk_size=34, gpu=gpu)
+
+    def g1(x):
+        return (x == "foo").sum()
+
+    def g2(x):
+        return (x != "bar").sum()
+
+    def g3(x):
+        # same as g2
+        return (x != "bar").sum()
+
+    pd.testing.assert_frame_equal(
+        df.groupby("a", as_index=False).agg((g1, g2, g3)),
+        mdf.groupby("a", as_index=False).agg((g1, g2, g3)).execute().fetch(),
+    )
+    if not gpu:
+        # cuDF doesn't support having multiple columns with same names yet.
+        pd.testing.assert_frame_equal(
+            df.groupby("a", as_index=as_index).agg((g1, g1)),
+            mdf.groupby("a", as_index=as_index).agg((g1, g1)).execute().fetch(),
+        )
+
+    pd.testing.assert_frame_equal(
+        df.groupby("a", as_index=as_index)["b"].agg((g1, g2, g3)),
+        mdf.groupby("a", as_index=as_index)["b"].agg((g1, g2, g3)).execute().fetch(),
+    )
+    if not gpu:
+        # cuDF doesn't support having multiple columns with same names yet.
+        pd.testing.assert_frame_equal(
+            df.groupby("a", as_index=as_index)["b"].agg((g1, g1)),
+            mdf.groupby("a", as_index=as_index)["b"].agg((g1, g1)).execute().fetch(),
+        )
+
+
+@support_cuda
+def test_groupby_agg_on_custom_funcs(setup_gpu, gpu):
+    rs = np.random.RandomState(0)
+    df = pd.DataFrame(
+        {
+            "a": rs.choice(["foo", "bar", "baz"], size=100),
+            "b": rs.choice(["foo", "bar", "baz"], size=100),
+            "c": rs.choice(["foo", "bar", "baz"], size=100),
+        },
+    )
+
+    mdf = md.DataFrame(df, chunk_size=34, gpu=gpu)
+
+    def g1(x):
+        return ("foo" == x).sum()
+
+    def g2(x):
+        return ("foo" != x).sum()
+
+    def g3(x):
+        return (x > "bar").sum()
+
+    def g4(x):
+        return (x >= "bar").sum()
+
+    def g5(x):
+        return (x < "baz").sum()
+
+    def g6(x):
+        return (x <= "baz").sum()
+
+    pd.testing.assert_frame_equal(
+        df.groupby("a", as_index=False).agg(
+            (
+                g1,
+                g2,
+                g3,
+                g4,
+                g5,
+                g6,
+            )
+        ),
+        mdf.groupby("a", as_index=False)
+        .agg(
+            (
+                g1,
+                g2,
+                g3,
+                g4,
+                g5,
+                g6,
+            )
+        )
+        .execute()
+        .fetch(),
+    )
+
+
+@pytest.mark.parametrize(
+    "window,min_periods,center,on,closed,agg",
+    list(
+        product(
+            [5, 10],
+            [1, 3],
+            [False, True],
+            [None, "c_1"],
+            ["right", "left", "both", "neither"],
+            [
+                "corr",
+                "cov",
+                "count",
+                "sum",
+                "mean",
+                "median",
+                "var",
+                "std",
+                "min",
+                "max",
+                "skew",
+                "kurt",
+            ],
+        )
+    ),
+)
+def test_df_groupby_rolling_agg(setup, window, min_periods, center, on, closed, agg):
+    # skipped for now due to https://github.com/pandas-dev/pandas/issues/52299
+    if agg in _PAIRWISE_AGG and on is not None:
+        return
+
+    pdf = pd.DataFrame(
+        data=np.random.randint(low=0, high=10, size=(10, 10)),
+        index=pd.date_range(start="2023-01-01", end="2023-01-10", freq="D"),
+        columns=[f"c_{i}" for i in range(10)],
+    )
+    pr = pdf.groupby(by="c_0").rolling(
+        window=window,
+        min_periods=min_periods,
+        center=center,
+        on=on,
+        axis=0,
+        closed=closed,
+    )
+    presult = getattr(pr, agg)()
+
+    mdf = md.DataFrame(pdf, chunk_size=5)
+    mr = mdf.groupby(by="c_0").rolling(
+        window=window,
+        min_periods=min_periods,
+        center=center,
+        on=on,
+        axis=0,
+        closed=closed,
+    )
+    mresult = getattr(mr, agg)()
+    mresult = mresult.execute().fetch()
+
+    pd.testing.assert_frame_equal(presult, mresult.sort_index())
+
+
+@pytest.mark.parametrize(
+    "window,min_periods,center,closed,agg",
+    list(
+        product(
+            [5, 10],
+            [1, 3],
+            [False, True],
+            ["right", "left", "both", "neither"],
+            [
+                "count",
+                "sum",
+                "mean",
+                "median",
+                "var",
+                "std",
+                "min",
+                "max",
+                "skew",
+                "kurt",
+            ],
+        )
+    ),
+)
+def test_series_groupby_rolling_agg(setup, window, min_periods, center, closed, agg):
+    ps = pd.Series(
+        data=np.random.randint(low=0, high=10, size=10),
+        index=pd.date_range(start="2023-01-01", end="2023-01-10", freq="D"),
+    )
+    pr = ps.groupby(ps > 5).rolling(
+        window=window, min_periods=min_periods, center=center, axis=0, closed=closed
+    )
+    presult = getattr(pr, agg)()
+
+    ms = md.Series(ps, chunk_size=5)
+    mr = ms.groupby(ms > 5).rolling(
+        window=window, min_periods=min_periods, center=center, axis=0, closed=closed
+    )
+    mresult = getattr(mr, agg)()
+    mresult = mresult.execute().fetch()
+
+    pd.testing.assert_series_equal(presult, mresult.sort_index())

@@ -15,6 +15,7 @@
 
 import os
 import pkgutil
+import subprocess as sp
 import sys
 import tempfile
 
@@ -29,7 +30,7 @@ from ...lib.sparse import SparseMatrix, SparseNDArray
 from ...tests.core import require_cudf, require_cupy
 from ..base import StorageLevel
 from ..cuda import CudaStorage
-from ..filesystem import DiskStorage
+from ..filesystem import AlluxioStorage, DiskStorage, JuiceFSStorage
 from ..plasma import PlasmaStorage
 from ..shared_memory import SharedMemoryStorage
 from ..vineyard import VineyardStorage
@@ -49,6 +50,12 @@ if (
     and pkgutil.find_loader("pyarrow.plasma") is not None
 ):
     params.append("plasma")
+alluxio = sp.getoutput("echo $ALLUXIO_HOME")
+juicefs = sp.getoutput("echo $JUICEFS_HOME")
+if "alluxio" in alluxio:
+    params.append("alluxio")
+if "juicefs" in juicefs:
+    params.append("juicefs")
 if vineyard is not None:
     params.append("vineyard")
 
@@ -66,6 +73,34 @@ async def storage_context(request):
         yield storage
 
         await storage.teardown(**teardown_params)
+    elif request.param == "alluxio":
+        tempdir = tempfile.mkdtemp()
+        params, teardown_params = await AlluxioStorage.setup(
+            root_dir=tempdir, local_environ=True
+        )
+        storage = AlluxioStorage(**params)
+        assert storage.level == StorageLevel.MEMORY
+
+        yield storage
+        await storage.teardown(**teardown_params)
+    elif request.param == "juicefs":
+        tempdir = tempfile.mkdtemp()
+        params, teardown_params = await JuiceFSStorage.setup(
+            root_dirs=[tempdir],
+            local_environ=True,
+            metadata_url="redis://127.0.0.1:6379/1",
+        )
+        storage = JuiceFSStorage(**params)
+        assert storage.level == StorageLevel.MEMORY
+
+        yield storage
+        await storage.teardown(**teardown_params)
+
+        with pytest.raises(
+            ValueError,
+            match="For external storage JuiceFS, you must specify the metadata url for its metadata storage, for example 'redis://172.17.0.5:6379/1'.",
+        ):
+            await JuiceFSStorage.setup(root_dirs=[tempdir], local_environ=True)
     elif request.param == "plasma":
         plasma_storage_size = 10 * 1024 * 1024
         if sys.platform == "darwin":
@@ -148,7 +183,11 @@ async def test_base_operations(storage_context):
     # FIXME: remove when list functionality is ready for vineyard.
     if not isinstance(storage, (VineyardStorage, SharedMemoryStorage)):
         num = len(await storage.list())
-        assert num == 2
+        # juicefs automatically generates 4 files accesslog, config, stats and trash so the num should be 6 for juicefs
+        if isinstance(storage, JuiceFSStorage):
+            assert num == 6
+        else:
+            assert num == 2
         await storage.delete(info2.object_id)
 
     # test SparseMatrix
@@ -265,6 +304,9 @@ async def test_cuda_backend():
     get_data1 = await storage.get(put_info1.object_id)
     cupy.testing.assert_array_equal(data1, get_data1)
 
+    with pytest.raises(NotImplementedError):
+        await storage.get(put_info1.object_id, conditions=[])
+
     info1 = await storage.object_info(put_info1.object_id)
     assert info1.size == put_info1.size
 
@@ -280,6 +322,9 @@ async def test_cuda_backend():
     put_info2 = await storage.put(data2)
     get_data2 = await storage.get(put_info2.object_id)
     cudf.testing.assert_frame_equal(data2, get_data2)
+
+    with pytest.raises(NotImplementedError):
+        await storage.get(put_info2.object_id, conditions=[])
 
     info2 = await storage.object_info(put_info2.object_id)
     assert info2.size == put_info2.size

@@ -19,7 +19,7 @@ import logging
 import operator
 from contextlib import contextmanager
 from numbers import Integral
-from typing import Any, List, Union
+from typing import Any, Callable, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,8 @@ from ..config import options
 from ..core import Entity, ExecutableTuple
 from ..core.context import Context
 from ..lib.mmh3 import hash as mmh_hash
+from ..storage import StorageLevel
+from ..tensor.array_utils import is_cupy
 from ..tensor.utils import dictify_chunk_size, normalize_chunk_sizes
 from ..typing import ChunkType, TileableType
 from ..utils import (
@@ -61,31 +63,93 @@ def hash_index(index, size):
     return [idx_to_grouped.get(i, list()) for i in range(size)]
 
 
+def _get_hash(
+    data: Union[
+        pd.DataFrame, pd.Series, pd.Index, "cudf.DataFrame", "cudf.Series", "cudf.Index"
+    ],
+    **kwargs,
+) -> Union[pd.Series, "cudf.Series"]:
+    """
+    The hash value of the cudf object is obtained by the ``hash_values`` interface.
+    Specifically, for the Index obj in cudf, convert it to DataFrame first.
+    """
+    return (
+        (data.to_frame().hash_values() if is_index(data) else data.hash_values())
+        if is_cudf(data)
+        else pd.util.hash_pandas_object(data, **kwargs)
+    )
+
+
+def _get_index_for_on(
+    data: Union[pd.Series, "cudf.Series"], size: int
+) -> List[Union[pd.Index, "cudf.Index"]]:
+    if is_cudf(data):
+        # Since cudf does not support groupby for RangeIndex,
+        # the following code is the equivalent implementation in the pandas (CPU) case.
+        series = cudf.Series(range(len(data)))
+        # reset_index(drop=True) is required,
+        # since series groupby will raise an exception if the index has duplicate values
+        groups = (data % size).reset_index(drop=True)
+        groupby = series.groupby(groups)
+        result = []
+        for i in range(size):
+            try:
+                idx = cudf.Index(groupby.get_group(i).drop_duplicates())
+            except KeyError:
+                idx = cudf.Index([])
+            result.append(idx)
+        return result
+    else:
+        idx_to_grouped = pd.RangeIndex(0, len(data)).groupby(data % size)
+        return [idx_to_grouped.get(i, pd.Index([])) for i in range(size)]
+
+
+def _get_index_map(
+    data: Union[pd.Series, pd.DataFrame, "cudf.DataFrame", "cudf.Series"], on: Callable
+) -> Union["cudf.Index", pd.Index]:
+    if is_cudf(data):
+        index = data.index
+        if not isinstance(index, cudf.MultiIndex):
+            # TODO: If ``on`` makes data change dimension, cudf would raise an error
+            return cudf.Index(index.to_series().map(on).values)
+        else:
+            # For cudf MultiIndex,
+            # cudf does not implement ``to_series`` method,
+            # if converted to dataframe first,
+            # df apply method in cudf has many restrictions,
+            # for example, does not support lambda function, etc.
+            # Therefore, cannot find a suitable way to implement ``MultiIndex.map`` for now.
+            raise NotImplementedError(
+                "Cannot support cudf.MultiIndex map method for now."
+            )
+    else:
+        return data.index.map(on)
+
+
 def hash_dataframe_on(df, on, size, level=None):
     if on is None:
         idx = df.index
         if level is not None:
             idx = idx.to_frame(False)[level]
-        if cudf and isinstance(idx, cudf.Index):  # pragma: no cover
-            idx = idx.to_pandas()
-        hashed_label = pd.util.hash_pandas_object(idx, categorize=False)
+        hashed_label = _get_hash(idx, categorize=False)
     elif callable(on):
         # todo optimization can be added, if ``on`` is a numpy ufunc or sth can be vectorized
-        hashed_label = pd.util.hash_pandas_object(df.index.map(on), categorize=False)
+        # TODO: cudf index may not have attribute ``map``
+        hashed_label = _get_hash(_get_index_map(df, on), categorize=False)
     else:
         if isinstance(on, list):
             to_concat = []
             for v in on:
-                if isinstance(v, pd.Series):
+                if is_series(v):
                     to_concat.append(v)
                 else:
                     to_concat.append(df[v])
-            data = pd.concat(to_concat, axis=1)
+            xpd = cudf if is_cudf(df) else pd
+            data = xpd.concat(to_concat, axis=1)
         else:
             data = df[on]
-        hashed_label = pd.util.hash_pandas_object(data, index=False, categorize=False)
-    idx_to_grouped = pd.RangeIndex(0, len(hashed_label)).groupby(hashed_label % size)
-    return [idx_to_grouped.get(i, pd.Index([])) for i in range(size)]
+        hashed_label = _get_hash(data, index=False, categorize=False)
+    return _get_index_for_on(hashed_label, size)
 
 
 def hash_dtypes(dtypes, size):
@@ -295,9 +359,17 @@ def parse_index(index_value, *args, store_data=False, key=None):
             return None
 
     def _serialize_index(index):
-        tp = getattr(IndexValue, type(index).__name__)
+        extra_properties = dict(_name=index.name)
+        if not is_pandas_2():
+            tp = getattr(IndexValue, type(index).__name__)
+        else:
+            # pandas 2.0 does not have `Int64Index`, `Float64Index`, etc.
+            name = type(index).__name__
+            if name == "Index":
+                extra_properties["_dtype"] = index.dtype
+            tp = getattr(IndexValue, type(index).__name__)
         properties = _extract_property(index, tp, store_data)
-        properties["_name"] = index.name
+        properties.update(extra_properties)
         return tp(**properties)
 
     def _serialize_range_index(index):
@@ -346,6 +418,7 @@ def parse_index(index_value, *args, store_data=False, key=None):
         )
     if hasattr(index_value, "to_pandas"):  # pragma: no cover
         # convert cudf.Index to pandas
+        # TODO: may lead to performance issue here due to data copy from cuda to memory
         index_value = index_value.to_pandas()
 
     if isinstance(index_value, _get_range_index_type()):
@@ -540,16 +613,19 @@ def _generate_value(dtype, fill_value):
     return convert(fill_value)
 
 
-def build_empty_df(dtypes, index=None):
+def build_empty_df(dtypes, index=None, gpu: Optional[bool] = False):
+    xpd = cudf if gpu is True else pd
     columns = dtypes.index
     length = len(index) if index is not None else 0
     record = [[_generate_value(dtype, 1) for dtype in dtypes]] * max(1, length)
 
     # duplicate column may exist,
     # so use RangeIndex first
-    df = pd.DataFrame(record, columns=range(len(dtypes)), index=index)
+    df = xpd.DataFrame(record, columns=range(len(dtypes)), index=index)
     for i, dtype in enumerate(dtypes):
         s = df.iloc[:, i]
+        # Even if ``s`` is a cudf object, ``s.dtype`` is always a numpy type,
+        # so ``pd.api.types.is_dtype_equal`` method is called properly here.
         if not pd.api.types.is_dtype_equal(s.dtype, dtype):
             df.iloc[:, i] = s.astype(dtype)
 
@@ -606,9 +682,17 @@ def build_df(df_obj, fill_value=1, size=1, ensure_string=False):
     return ret_df
 
 
-def build_empty_series(dtype, index=None, name=None):
+# by build a new series class, we can directly use pd.Index(Series) to turn it to Index Object.
+def build_empty_index(dtype, index=None, name=None, gpu: Optional[bool] = False):
+    xpd = cudf if gpu is True else pd
+    series_of_index = build_empty_series(dtype, index, name, gpu)
+    return xpd.Index(series_of_index)
+
+
+def build_empty_series(dtype, index=None, name=None, gpu: Optional[bool] = False):
+    xpd = cudf if gpu is True else pd
     length = len(index) if index is not None else 0
-    return pd.Series(
+    return xpd.Series(
         [_generate_value(dtype, 1) for _ in range(length)],
         dtype=dtype,
         index=index,
@@ -1160,8 +1244,7 @@ def fetch_corner_data(df_or_series, session=None) -> pd.DataFrame:
         head = iloc(df_or_series)[:index_size]
         tail = iloc(df_or_series)[-index_size:]
         head_data, tail_data = ExecutableTuple([head, tail]).fetch(session=session)
-        xdf = cudf if head.op.is_gpu() else pd
-        return xdf.concat([head_data, tail_data], axis="index")
+        return pd.concat([head_data, tail_data], axis="index")
 
 
 class ReprSeries(pd.Series):
@@ -1207,11 +1290,15 @@ def create_sa_connection(con, **kwargs):
         close = True
         dispose = False
     else:
-        engine = sa.create_engine(con, **kwargs)
-        con = engine.connect()
-        close = True
-        dispose = True
-
+        try:
+            engine = sa.create_engine(con, **kwargs)
+            con = engine.connect()
+            close = True
+            dispose = True
+        except AttributeError:  # pragma: no cover
+            raise NotImplementedError(
+                "The connection provided is not supported by xorbits. Please convert the connection to SQLAlchemy's engine type using the 'sqlalchemy.create_engine' function. Refer to the documentation for more details:https://docs.sqlalchemy.org/en/20/core/engines.html#backend-specific-urls"
+            )
     try:
         yield con
     finally:
@@ -1340,6 +1427,16 @@ def is_cudf(x):
     return False
 
 
+def get_storage_level_gpu_or_memory(data: Any) -> StorageLevel:
+    if isinstance(data, (tuple, list, set)):
+        return (
+            StorageLevel.GPU
+            if any([is_cudf(v) or is_cupy(v) for v in data])
+            else StorageLevel.MEMORY
+        )
+    return StorageLevel.GPU if is_cudf(data) or is_cupy(data) else StorageLevel.MEMORY
+
+
 def auto_merge_chunks(
     ctx: Context,
     df_or_series: TileableType,
@@ -1442,3 +1539,7 @@ def concat_on_columns(objs: List) -> Any:
     if xdf is cudf:
         result.index = objs[0].index
     return result
+
+
+def is_pandas_2():
+    return pd.__version__ >= "2.0.0"

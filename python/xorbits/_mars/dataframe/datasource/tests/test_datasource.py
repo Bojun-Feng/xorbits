@@ -26,7 +26,8 @@ import pytest
 from .... import tensor as mt
 from ....config import option_context
 from ....core import tile
-from ...core import DatetimeIndex, Float64Index, IndexValue, Int64Index
+from ....core.operand import estimate_size
+from ...core import DatetimeIndex, IndexValue
 from ..core import merge_small_files
 from ..dataframe import from_pandas as from_pandas_df
 from ..date_range import date_range
@@ -39,6 +40,7 @@ from ..from_tensor import (
 from ..index import from_pandas as from_pandas_index
 from ..index import from_tileable
 from ..read_csv import DataFrameReadCSV, read_csv
+from ..read_parquet import read_parquet
 from ..read_sql import DataFrameReadSQL, read_sql_query, read_sql_table
 from ..series import from_pandas as from_pandas_series
 
@@ -211,7 +213,6 @@ def test_from_tileable_index():
 
     for o in [df, df[0]]:
         index = o.index
-        assert isinstance(index, Int64Index)
         assert index.dtype == np.int64
         assert index.name == pd_df.index.name
         assert isinstance(index.index_value.value, IndexValue.Int64Index)
@@ -220,14 +221,12 @@ def test_from_tileable_index():
 
         assert len(index.chunks) == 2
         for c in index.chunks:
-            assert c.dtype == np.int64
             assert c.name == pd_df.index.name
             assert isinstance(c.index_value.value, IndexValue.Int64Index)
 
     t = mt.random.rand(10, chunk_size=6)
     index = from_tileable(t, name="new_name")
 
-    assert isinstance(index, Float64Index)
     assert index.dtype == np.float64
     assert index.name == "new_name"
     assert isinstance(index.index_value.value, IndexValue.Float64Index)
@@ -654,3 +653,49 @@ def test_merge_small_files():
         df2.chunks[1].index_value.to_pandas(), pd.RangeIndex(8, 16)
     )
     assert df2.nsplits == ((8, 8), (4,))
+
+
+def test_read_parquet_estimate_size():
+    test_df = pd.DataFrame(
+        {
+            "a": np.arange(10).astype(np.int64, copy=False),
+            "b": [f"s{i}" for i in range(10)],
+            "c": np.random.rand(10),
+        }
+    )
+
+    with tempfile.TemporaryDirectory() as tempdir:
+        file_path = os.path.join(tempdir, "test.parquet")
+        test_df.to_parquet(file_path)
+
+        df = read_parquet(file_path)
+        tiled = tile(df)
+        sizes = dict()
+        chunk = tiled.chunks[0]
+        estimate_size(sizes, chunk.op)
+        estimated_size = sizes[chunk.key][0]
+        assert estimated_size > test_df.memory_usage(deep=True).sum() * 1.5
+
+        df = read_parquet(file_path, columns=["a", "c"])
+        tiled = tile(df)
+        sizes = dict()
+        chunk = tiled.chunks[0]
+        estimate_size(sizes, chunk.op)
+        assert sizes[chunk.key][0] < estimated_size * (2 / 3)
+
+        df = read_parquet(file_path, use_arrow_dtype=True)
+        tiled = tile(df)
+        sizes = dict()
+        chunk = tiled.chunks[0]
+        estimate_size(sizes, chunk.op)
+        estimated_size_arrow = sizes[chunk.key][0]
+        estimated_size_arrow < estimated_size
+        assert estimated_size_arrow > test_df.memory_usage(deep=True).sum() * 1.5
+
+        df = read_parquet(file_path, use_arrow_dtype=True, columns=["a", "c"])
+        tiled = tile(df)
+        sizes = dict()
+        chunk = tiled.chunks[0]
+        estimate_size(sizes, chunk.op)
+        estimated_size_arrow = sizes[chunk.key][0]
+        assert sizes[chunk.key][0] < estimated_size * 2 / 3
